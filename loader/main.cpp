@@ -356,16 +356,44 @@ static int mutex_alloc(pthread_mutex_t **uid, int type) {
   return 0;
 }
 
-/* The .so hands us its own pthread_mutexattr_t, which under Bionic is a bare
- * int holding the type (NORMAL 0, RECURSIVE 1, ERRORCHECK 2). */
+/* Bionic's pthread_mutexattr_t is a bare 4-byte long whose low nibble holds
+ * the type (NORMAL 0, RECURSIVE 1, ERRORCHECK 2). newlib's is a pointer to a
+ * much larger struct, so handing the .so's on-stack attr to newlib's
+ * initialiser both scribbles past it and loses the type -- which turns a
+ * recursive mutex into a plain one and self-deadlocks the game thread the
+ * moment it re-locks. Implement the Bionic shape ourselves. */
+#define BIONIC_MUTEXATTR_TYPE_MASK 0x0f
+
+static int pthread_mutexattr_init_fake(int *attr) {
+  if (attr)
+    *attr = 0;
+  return 0;
+}
+
+static int pthread_mutexattr_settype_fake(int *attr, int type) {
+  if (!attr)
+    return 22 /* EINVAL */;
+  *attr = (*attr & ~BIONIC_MUTEXATTR_TYPE_MASK) |
+          (type & BIONIC_MUTEXATTR_TYPE_MASK);
+  return 0;
+}
+
+static int pthread_mutexattr_destroy_fake(int *attr) { return 0; }
+
 static int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *attr) {
   int type = PTHREAD_MUTEX_DEFAULT;
 
   if (attr) {
-    if (*attr == 1)
+    switch (*attr & BIONIC_MUTEXATTR_TYPE_MASK) {
+    case 1:
       type = PTHREAD_MUTEX_RECURSIVE;
-    else if (*attr == 2)
+      break;
+    case 2:
       type = PTHREAD_MUTEX_ERRORCHECK;
+      break;
+    default:
+      break;
+    }
   }
 
   return mutex_alloc(uid, type);
@@ -380,18 +408,33 @@ static int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *attr) {
  *
  * Anything at or below 0x8000 is therefore one of those sentinels and needs a
  * real mutex allocated behind it; anything above is one we already made. */
-static int ensure_mutex(pthread_mutex_t **uid) {
-  uintptr_t value = (uintptr_t)*uid;
+/* Promoting a sentinel to a real mutex has to be atomic. Two threads reaching
+ * the same statically initialised mutex at once would otherwise both allocate,
+ * the second store would win, and whoever locked the first object would never
+ * be unlocked again -- a deadlock that only shows up once the game is properly
+ * multi-threaded. Double-checked locking behind one global guard. */
+static pthread_mutex_t lazy_init_guard = PTHREAD_MUTEX_INITIALIZER;
 
-  if (value > 0x8000)
+static int ensure_mutex(pthread_mutex_t **uid) {
+  if ((uintptr_t)*uid > 0x8000)
     return 0;
 
-  if (value == 0x4000)
-    return mutex_alloc(uid, PTHREAD_MUTEX_RECURSIVE);
-  if (value == 0x8000)
-    return mutex_alloc(uid, PTHREAD_MUTEX_ERRORCHECK);
+  pthread_mutex_lock(&lazy_init_guard);
 
-  return mutex_alloc(uid, PTHREAD_MUTEX_DEFAULT);
+  int ret = 0;
+  uintptr_t value = (uintptr_t)*uid;
+
+  if (value <= 0x8000) {
+    int type = PTHREAD_MUTEX_DEFAULT;
+    if (value == 0x4000)
+      type = PTHREAD_MUTEX_RECURSIVE;
+    else if (value == 0x8000)
+      type = PTHREAD_MUTEX_ERRORCHECK;
+    ret = mutex_alloc(uid, type);
+  }
+
+  pthread_mutex_unlock(&lazy_init_guard);
+  return ret;
 }
 
 static int pthread_mutex_destroy_fake(pthread_mutex_t **uid) {
@@ -409,9 +452,12 @@ static int pthread_mutex_lock_fake(pthread_mutex_t **uid) {
   return pthread_mutex_lock(*uid);
 }
 
+static void set_owner(void *slot, SceUID owner);
+
 static int pthread_mutex_unlock_fake(pthread_mutex_t **uid) {
   if (ensure_mutex(uid) < 0)
     return -1;
+  set_owner(uid, 0);
   return pthread_mutex_unlock(*uid);
 }
 
@@ -432,10 +478,17 @@ static int pthread_cond_init_fake(pthread_cond_t **cnd, const int *attr) {
 
 static int ensure_cond(pthread_cond_t **cnd) {
   /* PTHREAD_COND_INITIALIZER is 0 under Bionic, but guard the same range as
-   * the mutexes so a stray sentinel is never dereferenced. */
+   * the mutexes so a stray sentinel is never dereferenced. Same race, same
+   * double-checked fix. */
   if ((uintptr_t)*cnd > 0x8000)
     return 0;
-  return pthread_cond_init_fake(cnd, NULL);
+
+  pthread_mutex_lock(&lazy_init_guard);
+  int ret = 0;
+  if ((uintptr_t)*cnd <= 0x8000)
+    ret = pthread_cond_init_fake(cnd, NULL);
+  pthread_mutex_unlock(&lazy_init_guard);
+  return ret;
 }
 
 static int pthread_cond_broadcast_fake(pthread_cond_t **cnd) {
@@ -1356,6 +1409,145 @@ static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
  * ambient, which we can safely ignore. */
 static SOFTFP_ABI void glLightModelf(GLenum pname, GLfloat param) {}
 
+/* Hang watchdog: per-thread record of the last shim called, plus who owns each
+ * contended mutex, so a stall names both the blocked thread and the holder. */
+#define TRACK_SLOTS 16
+
+static struct {
+  SceUID tid;
+  const char *shim;
+  unsigned arg;
+} thread_marks[TRACK_SLOTS];
+
+static struct {
+  void *slot;
+  SceUID owner;
+} mutex_owners[TRACK_SLOTS];
+
+static void mark_shim(const char *what, unsigned arg) {
+  SceUID tid = sceKernelGetThreadId();
+  for (int i = 0; i < TRACK_SLOTS; i++) {
+    if (thread_marks[i].tid == tid || thread_marks[i].tid == 0) {
+      thread_marks[i].tid = tid;
+      thread_marks[i].shim = what;
+      thread_marks[i].arg = arg;
+      return;
+    }
+  }
+}
+
+static const char *shim_of(SceUID tid, unsigned *arg) {
+  for (int i = 0; i < TRACK_SLOTS; i++) {
+    if (thread_marks[i].tid == tid) {
+      *arg = thread_marks[i].arg;
+      return thread_marks[i].shim;
+    }
+  }
+  *arg = 0;
+  return "(unknown)";
+}
+
+static void set_owner(void *slot, SceUID owner) {
+  for (int i = 0; i < TRACK_SLOTS; i++) {
+    if (mutex_owners[i].slot == slot || mutex_owners[i].slot == NULL) {
+      mutex_owners[i].slot = slot;
+      mutex_owners[i].owner = owner;
+      return;
+    }
+  }
+}
+
+static SceUID owner_of(void *slot) {
+  for (int i = 0; i < TRACK_SLOTS; i++) {
+    if (mutex_owners[i].slot == slot)
+      return mutex_owners[i].owner;
+  }
+  return 0;
+}
+
+static volatile const char *last_shim = "(none)";
+static volatile unsigned last_shim_arg;
+
+#define MARK(x)                                                                \
+  do {                                                                         \
+    last_shim = (x);                                                           \
+    mark_shim((x), 0);                                                         \
+  } while (0)
+#define MARK1(x, a)                                                            \
+  do {                                                                         \
+    last_shim = (x);                                                           \
+    last_shim_arg = (unsigned)(a);                                             \
+    mark_shim((x), (unsigned)(a));                                             \
+  } while (0)
+
+static FILE *fopen_mark(const char *path, const char *mode) {
+  MARK("fopen");
+  return fopen(path, mode);
+}
+
+static size_t fread_mark(void *p, size_t sz, size_t n, FILE *f) {
+  MARK1("fread", sz * n);
+  return fread(p, sz, n, f);
+}
+
+static int fseek_mark(FILE *f, long off, int whence) {
+  MARK("fseek");
+  return fseek(f, off, whence);
+}
+
+static int usleep_mark(unsigned int usec) {
+  MARK1("usleep", usec);
+  if (usec)
+    sceKernelDelayThread(usec);
+  return 0;
+}
+
+static int mutex_lock_mark(pthread_mutex_t **uid) {
+  MARK("pthread_mutex_lock");
+  if (ensure_mutex(uid) < 0)
+    return -1;
+
+  if (pthread_mutex_trylock(*uid) == 0) {
+    set_owner(uid, sceKernelGetThreadId());
+    return 0;
+  }
+
+  /* Contended. Report who is stuck and on what: the slot address lands in the
+   * .so's data, so it maps straight back to a named global. */
+  SceUInt64 start = sceKernelGetSystemTimeWide();
+  int reported = 0;
+
+  for (;;) {
+    if (pthread_mutex_trylock(*uid) == 0) {
+      set_owner(uid, sceKernelGetThreadId());
+      if (reported)
+        trace("[lock] t%08x got slot %p at last\n",
+              (unsigned)sceKernelGetThreadId(), (void *)uid);
+      return 0;
+    }
+
+    if (!reported && sceKernelGetSystemTimeWide() - start > 1000000) {
+      SceUID owner = owner_of(uid);
+      unsigned oarg = 0;
+      const char *oshim = shim_of(owner, &oarg);
+      trace("[lock] t%08x STUCK on .so+0x%x; holder=t%08x last=%s arg=0x%x\n",
+            (unsigned)sceKernelGetThreadId(),
+            (unsigned)((uintptr_t)uid - ff6_mod.text_base), (unsigned)owner,
+            oshim, oarg);
+      reported = 1;
+    }
+
+    sceKernelDelayThread(1000);
+  }
+}
+
+static int cond_wait_mark(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
+  MARK("pthread_cond_wait");
+  if (ensure_cond(cnd) < 0 || ensure_mutex(mtx) < 0)
+    return -1;
+  return pthread_cond_wait(*cnd, *mtx);
+}
+
 /* Experiment hook: with options.sound == 0 we refuse to create the OpenSL ES
  * engine, which is the quickest way to tell whether the game's clock is gated
  * on the sound system coming up. */
@@ -1435,6 +1627,7 @@ static void glTexImage2DHook(GLenum target, GLint level, GLint internalformat,
                              GLsizei width, GLsizei height, GLint border,
                              GLenum format, GLenum type, const void *pixels) {
   gl_stats.textures++;
+  MARK1("glTexImage2D", (unsigned)(width << 16 | height));
   trace("[gl] tex #%u id=%u %dx%d ifmt=0x%x fmt=0x%x type=0x%x%s\n",
         gl_stats.textures, gl_bound_texture, width, height, internalformat,
         format, type, pixels ? "" : " (empty)");
@@ -1468,6 +1661,7 @@ static void glCompressedTexImage2DHook(GLenum target, GLint level,
 }
 
 static void gl_stats_report(void) {
+  MARK("eglSwapBuffers");
   gl_stats.frames++;
   if (gl_stats.draws_this_frame > gl_stats.max_draws)
     gl_stats.max_draws = gl_stats.draws_this_frame;
@@ -1658,13 +1852,13 @@ static so_default_dynlib default_dynlib[] = {
     {"feof", (uintptr_t)&feof},
     {"fflush", (uintptr_t)&fflush_hook},
     {"floor", WRAP((double (*)(double))floor)},
-    {"fopen", (uintptr_t)&fopen},
+    {"fopen", (uintptr_t)&fopen_mark},
     {"fprintf", (uintptr_t)&fprintf_hook},
     {"fputc", (uintptr_t)&fputc_hook},
-    {"fread", (uintptr_t)&fread},
+    {"fread", (uintptr_t)&fread_mark},
     {"free", (uintptr_t)&free},
     {"frexp", WRAP((double (*)(double, int *))frexp)},
-    {"fseek", (uintptr_t)&fseek},
+    {"fseek", (uintptr_t)&fseek_mark},
     {"ftell", (uintptr_t)&ftell},
     {"fwrite", (uintptr_t)&fwrite},
     {"gettimeofday", (uintptr_t)&gettimeofday},
@@ -1716,7 +1910,7 @@ static so_default_dynlib default_dynlib[] = {
     {"strtol", (uintptr_t)&strtol},
     {"tanf", WRAP(tanf)},
     {"time", (uintptr_t)&time},
-    {"usleep", (uintptr_t)&usleep_fake},
+    {"usleep", (uintptr_t)&usleep_mark},
     {"vsprintf", (uintptr_t)&vsprintf},
     {"write", (uintptr_t)&write},
 
@@ -1728,7 +1922,7 @@ static so_default_dynlib default_dynlib[] = {
     {"pthread_cond_destroy", (uintptr_t)&pthread_cond_destroy_fake},
     {"pthread_cond_init", (uintptr_t)&pthread_cond_init_fake},
     {"pthread_cond_signal", (uintptr_t)&pthread_cond_signal_fake},
-    {"pthread_cond_wait", (uintptr_t)&pthread_cond_wait_fake},
+    {"pthread_cond_wait", (uintptr_t)&cond_wait_mark},
     {"pthread_create", (uintptr_t)&pthread_create_fake},
     {"pthread_detach", (uintptr_t)&pthread_detach},
     {"pthread_equal", (uintptr_t)&pthread_equal},
@@ -1739,11 +1933,11 @@ static so_default_dynlib default_dynlib[] = {
     {"pthread_key_delete", (uintptr_t)&pthread_key_delete},
     {"pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy_fake},
     {"pthread_mutex_init", (uintptr_t)&pthread_mutex_init_fake},
-    {"pthread_mutex_lock", (uintptr_t)&pthread_mutex_lock_fake},
+    {"pthread_mutex_lock", (uintptr_t)&mutex_lock_mark},
     {"pthread_mutex_unlock", (uintptr_t)&pthread_mutex_unlock_fake},
-    {"pthread_mutexattr_destroy", (uintptr_t)&pthread_mutexattr_destroy},
-    {"pthread_mutexattr_init", (uintptr_t)&pthread_mutexattr_init},
-    {"pthread_mutexattr_settype", (uintptr_t)&pthread_mutexattr_settype},
+    {"pthread_mutexattr_destroy", (uintptr_t)&pthread_mutexattr_destroy_fake},
+    {"pthread_mutexattr_init", (uintptr_t)&pthread_mutexattr_init_fake},
+    {"pthread_mutexattr_settype", (uintptr_t)&pthread_mutexattr_settype_fake},
     {"pthread_self", (uintptr_t)&pthread_self},
     {"pthread_setspecific", (uintptr_t)&pthread_setspecific},
 };
@@ -2034,6 +2228,19 @@ static int main_thread(SceSize args, void *argp) {
   for (int tick = 0;; tick++) {
     pump_touch();
     pump_buttons();
+    {
+      static unsigned seen_frames;
+      static int stalled_for;
+
+      if (gl_stats.frames != seen_frames) {
+        seen_frames = gl_stats.frames;
+        stalled_for = 0;
+      } else if (++stalled_for == 750) { /* 3 s without a swap */
+        trace("[watchdog] no swap for 3s at frame %u; last shim=%s arg=0x%x\n",
+              gl_stats.frames, (const char *)last_shim, last_shim_arg);
+      }
+    }
+
     if (tick % 250 == 0) {
       unsigned dispcnt = ff6_AgbIo ? ff6_AgbIo[0] : 0;
       trace("[state] mode=%d maincnt=%d touchflag=0x%x loadhalt=%d ishalt=%d "
