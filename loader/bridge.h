@@ -68,5 +68,6 @@ void setClipBoardCopy(const char *text);
 int isInputDialogOpen(void);
 
 void trace(const char *fmt, ...);
+int debugTextRegionNonzero(void);
 
 #endif

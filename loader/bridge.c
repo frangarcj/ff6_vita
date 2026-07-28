@@ -242,11 +242,21 @@ static void update_metrics(void) {
 }
 
 void setTextColor(int argb) {
+  static int logged;
+  if (logged < 8) {
+    logged++;
+    trace("[txt] setTextColor(0x%08x)\n", argb);
+  }
   paint_color = argb;
   /* Colour never reaches our bitmap: the .so ORs its own RGB over our alpha. */
 }
 
 void setTextFontSize(int size) {
+  static int logged;
+  if (logged < 8) {
+    logged++;
+    trace("[txt] setTextFontSize(%d)\n", size);
+  }
   if (size <= 0)
     size = 1;
   if (size == paint_size)
@@ -275,6 +285,14 @@ void setTextUTF8(const unsigned char *utf8, int length) {
   paint_text[length] = '\0';
   paint_text_len = length;
   text_dirty = 1;
+
+  {
+    static int logged;
+    if (logged < 120) {
+      logged++;
+      trace("[seq] setTextUTF8('%.24s' len=%d)\n", paint_text, length);
+    }
+  }
 }
 
 int getTextHeight(void) {
@@ -327,7 +345,10 @@ static void rasterize_text(void) {
   int width = getTextWidth();
   int height = getTextHeight();
 
-  /* Clear only the rows the previous string dirtied. */
+  /* TextGlyphTexture::drawGlyph reads this array with a hard-coded stride of
+   * 1024 pixels per row (verified in the disassembly: `add ip, ip, #4096` per
+   * row), so glyphs must be laid out at TEXT_IMG_W stride starting at (0,0).
+   * Clear only the rows the previous string dirtied. */
   if (text_clear_h > 0) {
     int rows = text_clear_h > TEXT_IMG_H ? TEXT_IMG_H : text_clear_h;
     int span = text_clear_w > TEXT_IMG_W ? TEXT_IMG_W : text_clear_w;
@@ -418,13 +439,51 @@ jni_intarray *getTextImg(void) {
     text_dirty = 0;
   }
 
+  /* DEBUG: prove whether the glyphs we rasterize actually carry coverage, and
+   * for which string, so an empty upload can be blamed on the right side of
+   * the JNI boundary. */
+  {
+    static int logged;
+    if (logged < 120) {
+      logged++;
+      int w = getTextWidth();
+      int h = getTextHeight();
+      int nonzero = 0;
+      for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+          if (text_image.elements[y * TEXT_IMG_W + x])
+            nonzero++;
+      trace("[seq] getTextImg '%.24s' w=%d h=%d nonzero=%d\n", paint_text, w, h,
+            nonzero);
+    }
+  }
+
   return &text_image;
 }
 
+/* Nonzero count over the glyph-cell region at the exact moment the engine
+ * takes the pixel pointer; a zero here with ink at getTextImg time means
+ * something cleared the buffer in between. */
+int debugTextRegionNonzero(void) {
+  if (!text_image.elements)
+    return -1;
+  int nonzero = 0;
+  for (int y = 0; y < 48; y++)
+    for (int x = 0; x < 48; x++)
+      if (text_image.elements[y * TEXT_IMG_W + x])
+        nonzero++;
+  return nonzero;
+}
+
 int getTextFontSize(int size) {
-  /* FF6.java sets the size and hands back the resulting line height. */
+  /* FF6.java sets the size and hands back the resulting line height. The
+   * glyph atlas geometry hangs off this value: TextGlyphTexture uses it as
+   * the atlas cell size and derives its glyph capacity as (1024/cell)^2, so
+   * returning 0 here permanently disables glyph registration. */
   setTextFontSize(size);
-  return getTextHeight();
+  int height = getTextHeight();
+  trace("[txt] getTextFontSize(%d) -> %d\n", size, height);
+  return height;
 }
 
 /* ==========================================================================
