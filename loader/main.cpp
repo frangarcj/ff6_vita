@@ -243,6 +243,31 @@ static int nanosleep_fake(const struct timespec *req, struct timespec *rem) {
   return 0;
 }
 
+/* The game's frame pacing hangs off clock_gettime(CLOCK_MONOTONIC): gettime()
+ * feeds frame_check()/frame_step(), which decide whether the logic advances a
+ * step. If the clock id is not supported the timespec comes back untouched,
+ * time never moves, and the game renders its opening state forever -- drawn,
+ * but faded out. Serve both ids off the Vita's monotonic microsecond counter. */
+static int clock_gettime_fake(int clk_id, struct timespec *ts) {
+  if (!ts)
+    return -1;
+
+  /* Count from our own start, the way Android's CLOCK_MONOTONIC counts from
+   * boot. The raw Vita counter is host uptime -- easily a million seconds --
+   * and any float that value passes through has a resolution coarser than a
+   * frame, which quietly rounds every animation delta to nothing. */
+  static SceUInt64 base;
+  SceUInt64 usec = sceKernelGetSystemTimeWide();
+
+  if (!base)
+    base = usec;
+  usec -= base;
+
+  ts->tv_sec = (time_t)(usec / 1000000);
+  ts->tv_nsec = (long)((usec % 1000000) * 1000);
+  return 0;
+}
+
 /* Bionic and newlib disagree on the numeric values of the open() flags, and
  * the .so was compiled against Bionic's. Passing them through unchanged means
  * O_CREAT never arrives: saving called
@@ -1639,6 +1664,63 @@ static SLresult slCreateEngineHook(SLObjectItf *engine, SLuint32 numOptions,
 
 static GLuint gl_bound_texture;
 
+/* Log exactly what the .so asks for, so a bad softfp hand-off can be told
+ * apart from the game genuinely modulating everything dark. */
+static SOFTFP_ABI void glColor4fHook(GLfloat r, GLfloat g, GLfloat b,
+                                     GLfloat a) {
+  extern unsigned gl_frame_counter(void);
+
+  /* Log each distinct colour once: if the logo's alpha never leaves 0 the
+     fade is not ramping, which is a different problem from it being hidden. */
+  static unsigned seen[64];
+  static int seen_count;
+
+  unsigned key = ((unsigned)(r * 255) << 24) | ((unsigned)(g * 255) << 16) |
+                 ((unsigned)(b * 255) << 8) | (unsigned)(a * 255);
+
+  int known = 0;
+  for (int i = 0; i < seen_count; i++) {
+    if (seen[i] == key) {
+      known = 1;
+      break;
+    }
+  }
+
+  if (!known) {
+    if (seen_count < (int)(sizeof(seen) / sizeof(seen[0])))
+      seen[seen_count++] = key;
+    trace("[col] frame %u: rgba=%d,%d,%d,%d (/1000)\n", gl_frame_counter(),
+          (int)(r * 1000), (int)(g * 1000), (int)(b * 1000), (int)(a * 1000));
+  }
+
+  glColor4f(r, g, b, a);
+}
+
+static struct {
+  GLint size;
+  GLenum type;
+  GLsizei stride;
+  const void *ptr;
+} gl_vtx, gl_tex;
+
+static void glVertexPointerHook(GLint size, GLenum type, GLsizei stride,
+                                const void *ptr) {
+  gl_vtx.size = size;
+  gl_vtx.type = type;
+  gl_vtx.stride = stride;
+  gl_vtx.ptr = ptr;
+  glVertexPointer(size, type, stride, ptr);
+}
+
+static void glTexCoordPointerHook(GLint size, GLenum type, GLsizei stride,
+                                  const void *ptr) {
+  gl_tex.size = size;
+  gl_tex.type = type;
+  gl_tex.stride = stride;
+  gl_tex.ptr = ptr;
+  glTexCoordPointer(size, type, stride, ptr);
+}
+
 static struct {
   unsigned frames;
   unsigned draws;
@@ -1652,15 +1734,51 @@ static struct {
   unsigned max_draws;
 } gl_stats;
 
+unsigned gl_frame_counter(void) { return gl_stats.frames; }
+
 static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
   gl_stats.draws++;
   gl_stats.draws_this_frame++;
 
   /* Dump one settled frame's worth of draw calls: which texture, how many
      vertices. That is enough to tell a UI overlay from a real scene. */
-  if (gl_stats.frames == 300)
-    trace("[gl] draw #%u mode=0x%x first=%d count=%d tex=%u\n",
-          gl_stats.draws_this_frame, mode, first, count, gl_bound_texture);
+  if (gl_stats.frames == 300 && gl_stats.draws_this_frame <= 5) {
+    GLfloat proj[16], mv[16], colour[4];
+    GLint blend_src = 0, blend_dst = 0, env = 0, carray = 0;
+
+    glGetFloatv(GL_PROJECTION_MATRIX, proj);
+    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
+    glGetFloatv(GL_CURRENT_COLOR, colour);
+    glGetIntegerv(GL_BLEND_SRC, &blend_src);
+    glGetIntegerv(GL_BLEND_DST, &blend_dst);
+    glGetIntegerv(GL_COLOR_ARRAY, &carray);
+    glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &env);
+
+    const float *v = (const float *)gl_vtx.ptr;
+
+    trace("[gl] draw #%u tex=%u vsize=%d vtype=0x%x stride=%d count=%d\n",
+          gl_stats.draws_this_frame, gl_bound_texture, gl_vtx.size,
+          gl_vtx.type, gl_vtx.stride, count);
+
+    if (v && gl_vtx.type == GL_FLOAT && gl_vtx.stride == 0 && gl_vtx.size == 3)
+      trace("[gl]   xyz0=(%d,%d,%d) xyz1=(%d,%d,%d) xyz2=(%d,%d,%d)\n",
+            (int)v[0], (int)v[1], (int)v[2], (int)v[3], (int)v[4], (int)v[5],
+            (int)v[6], (int)v[7], (int)v[8]);
+
+    /* Milli-units: these are all small fractions that integer truncation eats. */
+    trace("[gl]   colour=%d,%d,%d,%d (/1000) colourArray=%d env=0x%x "
+          "blend=0x%x/0x%x\n",
+          (int)(colour[0] * 1000), (int)(colour[1] * 1000),
+          (int)(colour[2] * 1000), (int)(colour[3] * 1000), carray, env,
+          blend_src, blend_dst);
+    trace("[gl]   proj diag=%d,%d,%d (/1000) trans=%d,%d,%d mv diag=%d,%d\n",
+          (int)(proj[0] * 1000), (int)(proj[5] * 1000), (int)(proj[10] * 1000),
+          (int)(proj[12] * 1000), (int)(proj[13] * 1000),
+          (int)(proj[14] * 1000), (int)(mv[0] * 1000), (int)(mv[5] * 1000));
+    trace("[gl]   tex2d=%d blend=%d alpha=%d depth=%d\n",
+          glIsEnabled(GL_TEXTURE_2D), glIsEnabled(GL_BLEND),
+          glIsEnabled(GL_ALPHA_TEST), glIsEnabled(GL_DEPTH_TEST));
+  }
 
   glDrawArrays(mode, first, count);
 }
@@ -1825,7 +1943,7 @@ static so_default_dynlib default_dynlib[] = {
     {"glClear", (uintptr_t)&glClearHook},
     {"glClearColor", WRAP(glClearColor)},
     {"glClearDepthf", WRAP(glClearDepthf)},
-    {"glColor4f", WRAP(glColor4f)},
+    {"glColor4f", (uintptr_t)&glColor4fHook},
     {"glColorMask", (uintptr_t)&glColorMask},
     {"glColorPointer", (uintptr_t)&glColorPointer},
     {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook},
@@ -1862,14 +1980,14 @@ static so_default_dynlib default_dynlib[] = {
     {"glScalef", WRAP(glScalef)},
     {"glScissor", (uintptr_t)&glScissor},
     {"glShadeModel", (uintptr_t)&glShadeModel},
-    {"glTexCoordPointer", (uintptr_t)&glTexCoordPointer},
+    {"glTexCoordPointer", (uintptr_t)&glTexCoordPointerHook},
     {"glTexEnvf", WRAP(glTexEnvf)},
     {"glTexImage2D", (uintptr_t)&glTexImage2DHook},
     {"glTexParameterf", (uintptr_t)&glTexParameterfHook},
     {"glTexParameteri", (uintptr_t)&glTexParameteriHook},
     {"glTexSubImage2D", (uintptr_t)&glTexSubImage2DHook},
     {"glTranslatef", WRAP(glTranslatef)},
-    {"glVertexPointer", (uintptr_t)&glVertexPointer},
+    {"glVertexPointer", (uintptr_t)&glVertexPointerHook},
     {"glViewport", (uintptr_t)&glViewportHook},
 
     /* zlib */
@@ -1905,7 +2023,7 @@ static so_default_dynlib default_dynlib[] = {
     {"atoi", (uintptr_t)&atoi},
     {"calloc", (uintptr_t)&calloc},
     {"ceilf", WRAP(ceilf)},
-    {"clock_gettime", (uintptr_t)&clock_gettime},
+    {"clock_gettime", (uintptr_t)&clock_gettime_fake},
     {"close", (uintptr_t)&close},
     {"cos", WRAP((double (*)(double))cos)},
     {"cosf", WRAP(cosf)},
@@ -2087,11 +2205,33 @@ static void resolve_symbols(void) {
  * on a black screen waiting for a tap on a dialog that was never drawn. There
  * is genuinely no save data here, so answer "read fine" and let it boot; the
  * game writes a real save the first time the player saves. */
-static int ReadSaveDataResultHook(void) { return 1; }
+static void *(*ff6_saveMgrInstance)(void);
+static int (*ff6_getResultReadFromFile)(void *self, int slot);
+
+static int file_exists(const char *path);
+
+static int ReadSaveDataResultHook(void) {
+  /* Only paper over the genuine first-run case. If save files exist, defer to
+   * the real accessor so actual corruption still gets reported. */
+  if (!file_exists(SAVE_PATH "/RockDat0.sav") &&
+      !file_exists(SAVE_PATH "/RockDat1.sav"))
+    return 1;
+
+  if (ff6_saveMgrInstance && ff6_getResultReadFromFile)
+    return ff6_getResultReadFromFile(ff6_saveMgrInstance(), -1);
+
+  return 1;
+}
 
 static void patch_game(void) {
+  ff6_saveMgrInstance = (void *(*)(void))so_symbol(
+      &ff6_mod, "_ZN19cMobileSaveLoadMngr11getInstanceEv");
+  ff6_getResultReadFromFile = (int (*)(void *, int))so_symbol(
+      &ff6_mod, "_ZN19cMobileSaveLoadMngr21getResultReadFromFileEi");
+
   hook_addr(so_symbol(&ff6_mod, "ReadSaveDataResult"),
             (uintptr_t)&ReadSaveDataResultHook);
+
 
   if (options.aspect) {
     /* DeviceIsGen5() together with !SysConfigIsWide() makes the engine render
@@ -2309,6 +2449,11 @@ static int main_thread(SceSize args, void *argp) {
 
     if (tick % 250 == 0) {
       unsigned dispcnt = ff6_AgbIo ? ff6_AgbIo[0] : 0;
+      /* GBA blend registers: BLDCNT 0x50, BLDALPHA 0x52, BLDY 0x54. BLDY at
+         full strength is a complete fade to black. */
+      unsigned bldcnt = ff6_AgbIo ? ff6_AgbIo[0x50 / 2] : 0;
+      unsigned bldalpha = ff6_AgbIo ? ff6_AgbIo[0x52 / 2] : 0;
+      unsigned bldy = ff6_AgbIo ? ff6_AgbIo[0x54 / 2] : 0;
       trace("[state] mode=%d maincnt=%d touchflag=0x%x loadhalt=%d ishalt=%d "
             "loaded=%d openloop=%d bg0=%d fade=%d map=%d DISPCNT=0x%04x%s\n",
             ff6_system_mode ? *ff6_system_mode : -1,
@@ -2322,6 +2467,8 @@ static int main_thread(SceSize args, void *argp) {
             ff6_IsFadeSmartPhone ? ff6_IsFadeSmartPhone() : -1,
             ff6_getFieldMapNo ? ff6_getFieldMapNo() : -1, dispcnt,
             (dispcnt & 0x80) ? " FORCED-BLANK" : "");
+      trace("[state]   BLDCNT=0x%04x BLDALPHA=0x%04x BLDY=0x%04x\n", bldcnt,
+            bldalpha, bldy);
     }
     sceKernelDelayThread(4000);
   }
