@@ -1,0 +1,7 @@
+android/
+build/
+*.velf
+*.elf
+*.vpk
+*.self
+eboot.bin
