@@ -21,7 +21,6 @@ typedef struct {
   int bilinear; /* force GL_LINEAR filtering on every texture */
   int lang;     /* 0 = system, otherwise getSystemLanguage() value + 1 */
   int msaa;     /* 0 = off, 1 = 2x, 2 = 4x */
-  int aspect;   /* 0 = pillarboxed 3:2, 1 = stretch to fullscreen */
   int sound;    /* 0 disables the OpenSL ES engine entirely */
 } config_opts;
 

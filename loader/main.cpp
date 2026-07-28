@@ -104,7 +104,6 @@ static void set_default_options(void) {
   options.bilinear = 0;
   options.lang = 0;
   options.msaa = 2;
-  options.aspect = 0;
   options.sound = 1;
 }
 
@@ -129,8 +128,6 @@ static void loadOptions(void) {
       options.lang = value;
     else if (strcmp("antialiasing", key) == 0)
       options.msaa = value;
-    else if (strcmp("aspect", key) == 0)
-      options.aspect = value;
     else if (strcmp("sound", key) == 0)
       options.sound = value;
   }
@@ -1459,8 +1456,148 @@ static unsigned fake_eglQuerySurface(void *dpy, void *surface, int attribute,
   return 1;
 }
 
+
+/* DIAGNOSTIC: two solid quads drawn through exactly the path the scene uses
+ * (GL_FLOAT vertex array, same ortho), one under the pillarboxed viewport the
+ * scene gets and one under the full-screen viewport the visible side panels
+ * get. Whichever shows up says where the scene is being lost. */
+GLuint probe_texture;
+
+static void draw_viewport_probe(void) {
+  static const GLfloat left_half[] = {0, 0, 254, 240, 0, 254,
+                                      0, 320, 254, 240, 320, 254};
+  static const GLfloat right_half[] = {240, 0,   254, 480, 0,   254,
+                                       240, 320, 254, 480, 320, 254};
+
+  glDisable(GL_TEXTURE_2D);
+  glDisable(GL_BLEND);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_ALPHA_TEST);
+
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glOrthof(0.0f, 480.0f, 320.0f, 0.0f, 0.0f, -255.0f);
+  glMatrixMode(GL_MODELVIEW);
+  glLoadIdentity();
+
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+  glDisableClientState(GL_COLOR_ARRAY);
+
+  /* RED, left half, under the scene's pillarboxed viewport */
+  glViewport(72, 0, 816, 544);
+  glColor4f(1.0f, 0.0f, 0.0f, 1.0f);
+  glVertexPointer(3, GL_FLOAT, 0, left_half);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+  /* GREEN, right half, under the full-screen viewport */
+  glViewport(0, 0, SCREEN_W, SCREEN_H);
+  glColor4f(0.0f, 1.0f, 0.0f, 1.0f);
+  glVertexPointer(3, GL_FLOAT, 0, right_half);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+  /* Three textured bands, same geometry and the same texture the game draws
+     the scene with, each changing exactly one thing:
+       A (top)    no blending
+       B (middle) the game's blend, texture matrix left as the game set it
+       C (bottom) the game's blend, texture matrix forced to identity
+     Whichever bands vanish name the culprit. */
+  static const GLfloat uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
+  static const GLfloat band_a[] = {0, 200, 254, 480, 200, 254,
+                                   0, 235, 254, 480, 235, 254};
+  static const GLfloat band_b[] = {0, 240, 254, 480, 240, 254,
+                                   0, 275, 254, 480, 275, 254};
+  static const GLfloat band_c[] = {0, 280, 254, 480, 280, 254,
+                                   0, 315, 254, 480, 315, 254};
+
+  /* Replay the captured scene draw, verbatim, in the top-left quarter. */
+  if (scene_draw.valid) {
+    glViewport(0, 0, SCREEN_W / 2, SCREEN_H / 2);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, scene_draw.texture);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(scene_draw.tsize, scene_draw.ttype, scene_draw.tstride,
+                      scene_draw.tptr);
+    if (scene_draw.colour_array) {
+      glEnableClientState(GL_COLOR_ARRAY);
+      glColorPointer(scene_draw.csize, scene_draw.ctype, scene_draw.cstride,
+                     scene_draw.cptr);
+    }
+    glVertexPointer(scene_draw.vsize, scene_draw.vtype, scene_draw.vstride,
+                    scene_draw.vptr);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisable(GL_TEXTURE_2D);
+    scene_draw.valid = 0;
+  }
+
+  if (probe_texture) {
+    glViewport(0, 0, SCREEN_W, SCREEN_H);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, probe_texture);
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glTexCoordPointer(2, GL_FLOAT, 0, uv);
+    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+    glDisable(GL_BLEND);
+    glVertexPointer(3, GL_FLOAT, 0, band_a);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glVertexPointer(3, GL_FLOAT, 0, band_b);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    /* Band C now tests the one thing left: a GL_UNSIGNED_BYTE per-vertex
+       colour array, which is what every scene draw uses and the only state
+       my earlier probes did not reproduce. Same white opaque values the game
+       supplies. */
+    static const unsigned char white[] = {255, 255, 255, 255, 255, 255, 255,
+                                          255, 255, 255, 255, 255, 255, 255,
+                                          255, 255};
+    glEnableClientState(GL_COLOR_ARRAY);
+    glColorPointer(4, GL_UNSIGNED_BYTE, 0, white);
+    glVertexPointer(3, GL_FLOAT, 0, band_c);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisableClientState(GL_COLOR_ARRAY);
+
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisable(GL_TEXTURE_2D);
+  }
+}
+
+static void probe_pixel(const char *what, int x, int y) {
+  unsigned char px[4] = {0, 0, 0, 0};
+  glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  trace("[px] %s (%d,%d) = %d,%d,%d,%d\n", what, x, y, px[0], px[1], px[2],
+        px[3]);
+}
+
 static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
   gl_stats_report();
+
+  /* Read the game's own output before covering it with the probe, then the
+     probe itself, so one run answers both questions without needing eyes. */
+  static unsigned swaps;
+  swaps++;
+  int sample = (swaps == 100 || swaps == 600);
+  if (sample) {
+    probe_pixel("game centre", SCREEN_W / 2, SCREEN_H / 2);
+    probe_pixel("game left", 200, SCREEN_H / 2);
+    probe_pixel("panel area", 30, SCREEN_H / 2);
+  }
+
+  draw_viewport_probe();
+
+  if (sample) {
+    probe_pixel("probe RED  (offset vp)", 300, SCREEN_H / 2);
+    probe_pixel("probe GREEN(full vp)", 700, SCREEN_H / 2);
+    probe_pixel("probe TEXTURED", 480, 40);
+  }
 
   /* The IME dialog has to be composited by the Vita's own display stack, so we
    * ask vitaGL to keep the framebuffer around while it is up. */
@@ -1662,7 +1799,91 @@ static SLresult slCreateEngineHook(SLObjectItf *engine, SLuint32 numOptions,
  * patching a single byte of the module.
  * ======================================================================== */
 
+static unsigned gl_dump_frame;
+/* Snapshot of the frame's first scene draw, replayed just before the swap --
+ * the one spot where drawing is known to reach the screen. If the very same
+ * call works there but not where the game issues it, the draw state is fine
+ * and the problem is when it happens; if it fails in both places, the state
+ * itself is at fault. */
+static struct {
+  int valid;
+  GLuint texture;
+  GLint vsize, csize, tsize;
+  GLenum vtype, ctype, ttype;
+  GLsizei vstride, cstride, tstride;
+  const void *vptr, *cptr, *tptr;
+  GLboolean colour_array;
+} scene_draw;
 static GLuint gl_bound_texture;
+
+/* cTsModel::drawModel saves the current matrix mode with
+ * glGetIntegerv(GL_MATRIX_MODE), switches to GL_TEXTURE, translates the
+ * texture matrix, and restores the saved mode afterwards -- but only if the
+ * saved value is >= 0. If that query is not answered the value is whatever was
+ * on the stack, the restore is skipped, and the texture matrix keeps its
+ * translation, which walks every later texture lookup off the atlas. Track the
+ * mode ourselves so the query is always right. */
+static GLint gl_matrix_mode = GL_MODELVIEW;
+
+static const char *client_state_name(GLenum a) {
+  switch (a) {
+  case GL_VERTEX_ARRAY: return "VERTEX";
+  case GL_TEXTURE_COORD_ARRAY: return "TEXCOORD";
+  case GL_COLOR_ARRAY: return "COLOR";
+  case GL_NORMAL_ARRAY: return "NORMAL";
+  default: return "?";
+  }
+}
+
+static int gl_client_logged;
+
+static void glEnableClientStateHook(GLenum array) {
+  if (gl_client_logged < 12) {
+    trace("[cs] enable %s (0x%x)\n", client_state_name(array), array);
+    gl_client_logged++;
+  }
+  glEnableClientState(array);
+}
+
+static void glDisableClientStateHook(GLenum array) {
+  if (gl_client_logged < 12) {
+    trace("[cs] disable %s (0x%x)\n", client_state_name(array), array);
+    gl_client_logged++;
+  }
+  glDisableClientState(array);
+}
+
+static void glMatrixModeHook(GLenum mode) {
+  gl_matrix_mode = (GLint)mode;
+  if (mode == GL_TEXTURE)
+    trace("[gl] glMatrixMode(GL_TEXTURE) -- cTsModel::drawModel path is live\n");
+  glMatrixMode(mode);
+}
+
+static void glGetIntegervHook(GLenum pname, GLint *params) {
+  if (pname == GL_MATRIX_MODE && params) {
+    GLint from_vitagl = -12345;
+    glGetIntegerv(pname, &from_vitagl);
+    *params = gl_matrix_mode;
+    trace("[gl] GL_MATRIX_MODE queried: vitaGL said 0x%x, we answer 0x%x\n",
+          from_vitagl, gl_matrix_mode);
+    return;
+  }
+  glGetIntegerv(pname, params);
+}
+
+/* Per-texture provenance: uploaded with pixels, or created empty and filled by
+ * glTexSubImage2D afterwards? The scene atlases take the second route and the
+ * visible side panels take the first -- the one difference that lines up with
+ * what does and does not appear. */
+#define TEX_TRACK 256
+static struct {
+  unsigned char created_with_data;
+  unsigned short subs;
+} tex_info[TEX_TRACK];
+
+extern GLuint probe_texture;
+static GLfloat gl_cur_colour[4] = {1, 1, 1, 1};
 
 /* Log exactly what the .so asks for, so a bad softfp hand-off can be told
  * apart from the game genuinely modulating everything dark. */
@@ -1693,6 +1914,13 @@ static SOFTFP_ABI void glColor4fHook(GLfloat r, GLfloat g, GLfloat b,
           (int)(r * 1000), (int)(g * 1000), (int)(b * 1000), (int)(a * 1000));
   }
 
+  if (r > 0.99f && g > 0.99f && b > 0.99f && a > 0.99f && !gl_dump_frame)
+    gl_dump_frame = gl_frame_counter() + 1;
+
+  gl_cur_colour[0] = r;
+  gl_cur_colour[1] = g;
+  gl_cur_colour[2] = b;
+  gl_cur_colour[3] = a;
   glColor4f(r, g, b, a);
 }
 
@@ -1710,6 +1938,22 @@ static void glVertexPointerHook(GLint size, GLenum type, GLsizei stride,
   gl_vtx.stride = stride;
   gl_vtx.ptr = ptr;
   glVertexPointer(size, type, stride, ptr);
+}
+
+static struct {
+  GLint size;
+  GLenum type;
+  GLsizei stride;
+  const void *ptr;
+} gl_col;
+
+static void glColorPointerHook(GLint size, GLenum type, GLsizei stride,
+                               const void *ptr) {
+  gl_col.size = size;
+  gl_col.type = type;
+  gl_col.stride = stride;
+  gl_col.ptr = ptr;
+  glColorPointer(size, type, stride, ptr);
 }
 
 static void glTexCoordPointerHook(GLint size, GLenum type, GLsizei stride,
@@ -1739,45 +1983,71 @@ unsigned gl_frame_counter(void) { return gl_stats.frames; }
 static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
   gl_stats.draws++;
   gl_stats.draws_this_frame++;
+  if (gl_vtx.type == GL_FLOAT && gl_bound_texture) {
+    probe_texture = gl_bound_texture;
+    if (!scene_draw.valid) {
+      scene_draw.valid = 1;
+      scene_draw.texture = gl_bound_texture;
+      scene_draw.vsize = gl_vtx.size;
+      scene_draw.vtype = gl_vtx.type;
+      scene_draw.vstride = gl_vtx.stride;
+      scene_draw.vptr = gl_vtx.ptr;
+      scene_draw.tsize = gl_tex.size;
+      scene_draw.ttype = gl_tex.type;
+      scene_draw.tstride = gl_tex.stride;
+      scene_draw.tptr = gl_tex.ptr;
+      scene_draw.csize = gl_col.size;
+      scene_draw.ctype = gl_col.type;
+      scene_draw.cstride = gl_col.stride;
+      scene_draw.cptr = gl_col.ptr;
+      scene_draw.colour_array = glIsEnabled(GL_COLOR_ARRAY);
+    }
+  }
 
   /* Dump one settled frame's worth of draw calls: which texture, how many
      vertices. That is enough to tell a UI overlay from a real scene. */
-  if (gl_stats.frames == 300 && gl_stats.draws_this_frame <= 5) {
-    GLfloat proj[16], mv[16], colour[4];
-    GLint blend_src = 0, blend_dst = 0, env = 0, carray = 0;
-
-    glGetFloatv(GL_PROJECTION_MATRIX, proj);
-    glGetFloatv(GL_MODELVIEW_MATRIX, mv);
-    glGetFloatv(GL_CURRENT_COLOR, colour);
-    glGetIntegerv(GL_BLEND_SRC, &blend_src);
-    glGetIntegerv(GL_BLEND_DST, &blend_dst);
-    glGetIntegerv(GL_COLOR_ARRAY, &carray);
-    glGetTexEnviv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, &env);
-
+  /* Dump a whole frame in submission order once the fade has finished: if the
+     scene is being painted and then covered, the culprit shows up as a late
+     opaque fullscreen quad. */
+  if (gl_dump_frame && gl_stats.frames == gl_dump_frame) {
     const float *v = (const float *)gl_vtx.ptr;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
 
-    trace("[gl] draw #%u tex=%u vsize=%d vtype=0x%x stride=%d count=%d\n",
-          gl_stats.draws_this_frame, gl_bound_texture, gl_vtx.size,
-          gl_vtx.type, gl_vtx.stride, count);
+    if (v && gl_vtx.type == GL_FLOAT && gl_vtx.stride == 0 &&
+        gl_vtx.size == 3) {
+      x0 = (int)v[0];
+      y0 = (int)v[1];
+      x1 = (int)v[3];
+      y1 = (int)v[7];
+    }
 
-    if (v && gl_vtx.type == GL_FLOAT && gl_vtx.stride == 0 && gl_vtx.size == 3)
-      trace("[gl]   xyz0=(%d,%d,%d) xyz1=(%d,%d,%d) xyz2=(%d,%d,%d)\n",
-            (int)v[0], (int)v[1], (int)v[2], (int)v[3], (int)v[4], (int)v[5],
-            (int)v[6], (int)v[7], (int)v[8]);
-
-    /* Milli-units: these are all small fractions that integer truncation eats. */
-    trace("[gl]   colour=%d,%d,%d,%d (/1000) colourArray=%d env=0x%x "
-          "blend=0x%x/0x%x\n",
-          (int)(colour[0] * 1000), (int)(colour[1] * 1000),
-          (int)(colour[2] * 1000), (int)(colour[3] * 1000), carray, env,
-          blend_src, blend_dst);
-    trace("[gl]   proj diag=%d,%d,%d (/1000) trans=%d,%d,%d mv diag=%d,%d\n",
-          (int)(proj[0] * 1000), (int)(proj[5] * 1000), (int)(proj[10] * 1000),
-          (int)(proj[12] * 1000), (int)(proj[13] * 1000),
-          (int)(proj[14] * 1000), (int)(mv[0] * 1000), (int)(mv[5] * 1000));
-    trace("[gl]   tex2d=%d blend=%d alpha=%d depth=%d\n",
-          glIsEnabled(GL_TEXTURE_2D), glIsEnabled(GL_BLEND),
-          glIsEnabled(GL_ALPHA_TEST), glIsEnabled(GL_DEPTH_TEST));
+    trace("[frm] #%02u tex=%-3u rgba=%d,%d,%d,%d quad=(%d,%d)-(%d,%d) "
+          "blend=%d tex2d=%d vtype=0x%x\n",
+          gl_stats.draws_this_frame, gl_bound_texture,
+          (int)(gl_cur_colour[0] * 1000), (int)(gl_cur_colour[1] * 1000),
+          (int)(gl_cur_colour[2] * 1000), (int)(gl_cur_colour[3] * 1000), x0,
+          y0, x1, y1, glIsEnabled(GL_BLEND), glIsEnabled(GL_TEXTURE_2D),
+          gl_vtx.type);
+    trace("[frm]    vArray=%d tArray=%d cArray=%d\n",
+          glIsEnabled(GL_VERTEX_ARRAY), glIsEnabled(GL_TEXTURE_COORD_ARRAY),
+          glIsEnabled(GL_COLOR_ARRAY));
+    if (glIsEnabled(GL_COLOR_ARRAY) && gl_col.ptr) {
+      trace("[frm]    colourArray size=%d type=0x%x stride=%d\n", gl_col.size,
+            gl_col.type, gl_col.stride);
+      if (gl_col.type == GL_UNSIGNED_BYTE) {
+        const unsigned char *c = (const unsigned char *)gl_col.ptr;
+        trace("[frm]      c0=%d,%d,%d,%d c1=%d,%d,%d,%d\n", c[0], c[1], c[2],
+              c[3], c[4], c[5], c[6], c[7]);
+      } else if (gl_col.type == GL_FLOAT) {
+        const float *c = (const float *)gl_col.ptr;
+        trace("[frm]      c0=%d,%d,%d,%d (/1000)\n", (int)(c[0] * 1000),
+              (int)(c[1] * 1000), (int)(c[2] * 1000), (int)(c[3] * 1000));
+      }
+    }
+    if (gl_bound_texture < TEX_TRACK)
+      trace("[frm]    tex%u: madeWithData=%d subUploads=%d\n",
+            gl_bound_texture, tex_info[gl_bound_texture].created_with_data,
+            tex_info[gl_bound_texture].subs);
   }
 
   glDrawArrays(mode, first, count);
@@ -1785,10 +2055,32 @@ static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
 
 static void glClearHook(GLbitfield mask) {
   gl_stats.clears++;
+  if (gl_dump_frame && gl_stats.frames == gl_dump_frame)
+    trace("[frm] -- CLEAR mask=0x%x after %u draws --\n", mask,
+          gl_stats.draws_this_frame);
   glClear(mask);
 }
 
+/* The engine re-sets the viewport to the value it already has several times a
+ * frame, and only the draws issued after the last one survive. Swallow the
+ * redundant calls so a no-op cannot disturb the scene. */
 static void glViewportHook(GLint x, GLint y, GLsizei w, GLsizei h) {
+  static GLint cur[4] = {-1, -1, -1, -1};
+
+  if (gl_dump_frame && gl_stats.frames == gl_dump_frame)
+    trace("[frm] -- VIEWPORT %d,%d %dx%d after %u draws%s --\n", x, y, w, h,
+          gl_stats.draws_this_frame,
+          (x == cur[0] && y == cur[1] && w == cur[2] && h == cur[3])
+              ? " (redundant, skipped)"
+              : "");
+
+  if (x == cur[0] && y == cur[1] && w == cur[2] && h == cur[3])
+    return;
+
+  cur[0] = x;
+  cur[1] = y;
+  cur[2] = w;
+  cur[3] = h;
   gl_stats.last_viewport[0] = x;
   gl_stats.last_viewport[1] = y;
   gl_stats.last_viewport[2] = w;
@@ -1812,9 +2104,10 @@ static void glTexImage2DHook(GLenum target, GLint level, GLint internalformat,
                              GLenum format, GLenum type, const void *pixels) {
   gl_stats.textures++;
   MARK1("glTexImage2D", (unsigned)(width << 16 | height));
-  trace("[gl] tex #%u id=%u %dx%d ifmt=0x%x fmt=0x%x type=0x%x%s\n",
-        gl_stats.textures, gl_bound_texture, width, height, internalformat,
-        format, type, pixels ? "" : " (empty)");
+  if (gl_bound_texture < TEX_TRACK) {
+    tex_info[gl_bound_texture].created_with_data = pixels ? 1 : 0;
+    tex_info[gl_bound_texture].subs = 0;
+  }
   glTexImage2D(target, level, internalformat, width, height, border, format,
                type, pixels);
 }
@@ -1824,6 +2117,8 @@ static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
                                 GLenum format, GLenum type,
                                 const void *pixels) {
   gl_stats.tex_subs++;
+  if (gl_bound_texture < TEX_TRACK && tex_info[gl_bound_texture].subs < 0xffff)
+    tex_info[gl_bound_texture].subs++;
   glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
                   pixels);
 }
@@ -1945,24 +2240,24 @@ static so_default_dynlib default_dynlib[] = {
     {"glClearDepthf", WRAP(glClearDepthf)},
     {"glColor4f", (uintptr_t)&glColor4fHook},
     {"glColorMask", (uintptr_t)&glColorMask},
-    {"glColorPointer", (uintptr_t)&glColorPointer},
+    {"glColorPointer", (uintptr_t)&glColorPointerHook},
     {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook},
     {"glCullFace", (uintptr_t)&glCullFace},
     {"glDeleteTextures", (uintptr_t)&glDeleteTextures},
     {"glDepthFunc", (uintptr_t)&glDepthFunc},
     {"glDepthMask", (uintptr_t)&glDepthMask},
     {"glDisable", (uintptr_t)&glDisable},
-    {"glDisableClientState", (uintptr_t)&glDisableClientState},
+    {"glDisableClientState", (uintptr_t)&glDisableClientStateHook},
     {"glDrawArrays", (uintptr_t)&glDrawArraysHook},
     {"glEnable", (uintptr_t)&glEnable},
-    {"glEnableClientState", (uintptr_t)&glEnableClientState},
+    {"glEnableClientState", (uintptr_t)&glEnableClientStateHook},
     {"glFogf", WRAP(glFogf)},
     {"glFogfv", (uintptr_t)&glFogfv},
     {"glFrontFace", (uintptr_t)&glFrontFace},
     {"glFrustumf", WRAP(glFrustumf)},
     {"glGenTextures", (uintptr_t)&glGenTextures},
     {"glGetFloatv", (uintptr_t)&glGetFloatv},
-    {"glGetIntegerv", (uintptr_t)&glGetIntegerv},
+    {"glGetIntegerv", (uintptr_t)&glGetIntegervHook},
     {"glHint", (uintptr_t)&glHint},
     {"glLightModelf", (uintptr_t)&glLightModelf},
     {"glLightfv", (uintptr_t)&glLightfv},
@@ -1970,7 +2265,7 @@ static so_default_dynlib default_dynlib[] = {
     {"glLoadMatrixf", (uintptr_t)&glLoadMatrixf},
     {"glMaterialf", WRAP(glMaterialf)},
     {"glMaterialfv", (uintptr_t)&glMaterialfv},
-    {"glMatrixMode", (uintptr_t)&glMatrixMode},
+    {"glMatrixMode", (uintptr_t)&glMatrixModeHook},
     {"glMultMatrixf", (uintptr_t)&glMultMatrixf},
     {"glNormalPointer", (uintptr_t)&glNormalPointer},
     {"glOrthof", (uintptr_t)&glOrthofHook},
@@ -2233,13 +2528,12 @@ static void patch_game(void) {
             (uintptr_t)&ReadSaveDataResultHook);
 
 
-  if (options.aspect) {
-    /* DeviceIsGen5() together with !SysConfigIsWide() makes the engine render
-     * at the full screen size instead of the pillarboxed 3:2 box that matches
-     * the GBA's 240x160 output. */
-    hook_addr(so_symbol(&ff6_mod, "DeviceIsGen5"), (uintptr_t)&ret1);
-    hook_addr(so_symbol(&ff6_mod, "SysConfigIsWide"), (uintptr_t)&ret0);
-  }
+  /* No aspect override here. DeviceIsGen5 (.so+0x200098) and SysConfigIsWide
+   * (.so+0x20009c) are four bytes apart, and hook_addr writes eight, so
+   * patching the first destroys the second and the loader crashes on boot.
+   * The default path already picks the largest 3:2 box that fits, which is
+   * 816x544 on a Vita and matches the GBA's 240x160 aspect, so there is
+   * nothing to gain until this can be done without clobbering. */
 }
 
 /* ==========================================================================
