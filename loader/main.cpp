@@ -139,6 +139,31 @@ static void loadOptions(void) {
  * Trivial libc / logging shims
  * ======================================================================== */
 
+/* Boot tracing: the emulator buffers tty output, so a host-side crash loses it.
+ * Writing through sceIo and closing every time survives anything. */
+static void trace(const char *fmt, ...) {
+  char line[256];
+  va_list list;
+
+  va_start(list, fmt);
+  int len = vsnprintf(line, sizeof(line), fmt, list);
+  va_end(list);
+
+  if (len < 0)
+    return;
+  if (len > (int)sizeof(line) - 1)
+    len = sizeof(line) - 1;
+
+  sceClibPrintf("%s", line);
+
+  SceUID fd = sceIoOpen(DATA_PATH "/boot.log",
+                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+  if (fd < 0)
+    return;
+  sceIoWrite(fd, line, len);
+  sceIoClose(fd);
+}
+
 static int ret0(void) { return 0; }
 static int ret1(void) { return 1; }
 static void *retNULL(void) { return NULL; }
@@ -293,17 +318,21 @@ static void *__gnu_Unwind_Find_exidx(void *pc, int *pcount) {
  * the .so's storage as a pointer slot and allocate lazily.
  * ======================================================================== */
 
-static int pthread_mutex_init_fake(pthread_mutex_t **uid,
-                                   const pthread_mutexattr_t *attr) {
+static int mutex_alloc(pthread_mutex_t **uid, int type) {
   pthread_mutex_t *m = (pthread_mutex_t *)calloc(1, sizeof(pthread_mutex_t));
   if (!m)
     return -1;
 
-  const int recursive = (attr && *(const int *)attr == 1);
-  *m = recursive ? PTHREAD_RECURSIVE_MUTEX_INITIALIZER
-                 : PTHREAD_MUTEX_INITIALIZER;
+  *m = (type == PTHREAD_MUTEX_RECURSIVE) ? PTHREAD_RECURSIVE_MUTEX_INITIALIZER
+                                         : PTHREAD_MUTEX_INITIALIZER;
 
-  if (pthread_mutex_init(m, attr) < 0) {
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, type);
+  int ret = pthread_mutex_init(m, &attr);
+  pthread_mutexattr_destroy(&attr);
+
+  if (ret < 0) {
     free(m);
     return -1;
   }
@@ -312,14 +341,46 @@ static int pthread_mutex_init_fake(pthread_mutex_t **uid,
   return 0;
 }
 
+/* The .so hands us its own pthread_mutexattr_t, which under Bionic is a bare
+ * int holding the type (NORMAL 0, RECURSIVE 1, ERRORCHECK 2). */
+static int pthread_mutex_init_fake(pthread_mutex_t **uid, const int *attr) {
+  int type = PTHREAD_MUTEX_DEFAULT;
+
+  if (attr) {
+    if (*attr == 1)
+      type = PTHREAD_MUTEX_RECURSIVE;
+    else if (*attr == 2)
+      type = PTHREAD_MUTEX_ERRORCHECK;
+  }
+
+  return mutex_alloc(uid, type);
+}
+
+/* Bionic's statically initialised mutexes are small magic values rather than
+ * pointers, and libFF6.so is full of them:
+ *
+ *   PTHREAD_MUTEX_INITIALIZER            = 0
+ *   PTHREAD_RECURSIVE_MUTEX_INITIALIZER  = 0x4000
+ *   PTHREAD_ERRORCHECK_MUTEX_INITIALIZER = 0x8000
+ *
+ * Anything at or below 0x8000 is therefore one of those sentinels and needs a
+ * real mutex allocated behind it; anything above is one we already made. */
 static int ensure_mutex(pthread_mutex_t **uid) {
-  if (*uid)
+  uintptr_t value = (uintptr_t)*uid;
+
+  if (value > 0x8000)
     return 0;
-  return pthread_mutex_init_fake(uid, NULL);
+
+  if (value == 0x4000)
+    return mutex_alloc(uid, PTHREAD_MUTEX_RECURSIVE);
+  if (value == 0x8000)
+    return mutex_alloc(uid, PTHREAD_MUTEX_ERRORCHECK);
+
+  return mutex_alloc(uid, PTHREAD_MUTEX_DEFAULT);
 }
 
 static int pthread_mutex_destroy_fake(pthread_mutex_t **uid) {
-  if (uid && *uid) {
+  if (uid && (uintptr_t)*uid > 0x8000) {
     pthread_mutex_destroy(*uid);
     free(*uid);
     *uid = NULL;
@@ -355,7 +416,9 @@ static int pthread_cond_init_fake(pthread_cond_t **cnd, const int *attr) {
 }
 
 static int ensure_cond(pthread_cond_t **cnd) {
-  if (*cnd)
+  /* PTHREAD_COND_INITIALIZER is 0 under Bionic, but guard the same range as
+   * the mutexes so a stray sentinel is never dereferenced. */
+  if ((uintptr_t)*cnd > 0x8000)
     return 0;
   return pthread_cond_init_fake(cnd, NULL);
 }
@@ -373,7 +436,7 @@ static int pthread_cond_signal_fake(pthread_cond_t **cnd) {
 }
 
 static int pthread_cond_destroy_fake(pthread_cond_t **cnd) {
-  if (cnd && *cnd) {
+  if (cnd && (uintptr_t)*cnd > 0x8000) {
     pthread_cond_destroy(*cnd);
     free(*cnd);
     *cnd = NULL;
@@ -1586,10 +1649,13 @@ static int main_thread(SceSize args, void *argp) {
   /* The high-resolution battle renderer is the only path that uses the depth
    * buffer, so vitaGL has to be brought up with one or combats break while the
    * field looks fine. */
+  trace("[ff6] vglInitExtended...\n");
   vglInitExtended(0, SCREEN_W, SCREEN_H,
                   MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, msaa);
 
+  trace("[ff6] resolve_symbols...\n");
   resolve_symbols();
+  trace("[ff6] g_app=%p initGame=%p\n", g_app, (void *)ff6_initGame);
 
   /* Stand in for what ANativeActivity_onCreate + the glue would have set up. */
   memset(&g_activity, 0, sizeof(g_activity));
@@ -1613,7 +1679,9 @@ static int main_thread(SceSize args, void *argp) {
 
   /* This is android_main() minus the looper. Order matters: initMainFrame()
    * memsets the whole 224-byte g_app, so the app pointer has to go in after. */
+  trace("[ff6] initMainFrame...\n");
   ff6_initMainFrame();
+  trace("[ff6] File_SetAAssetManager...\n");
   ff6_File_SetAAssetManager(&g_activity);
 
   *(void **)(g_app + ENGINE_APP) = &g_android_app;
@@ -1623,7 +1691,9 @@ static int main_thread(SceSize args, void *argp) {
   *engine_field(ENGINE_SCREEN_H) = SCREEN_H;
 
   /* initGame() spawns thread_main, which owns EGL/GL and runs AgbMain. */
+  trace("[ff6] initGame...\n");
   ff6_initGame();
+  trace("[ff6] initGame done, entering input loop\n");
 
   if (ff6_inputGamePadSetActive)
     ff6_inputGamePadSetActive(1);
@@ -1680,16 +1750,27 @@ int main(int argc, char *argv[]) {
   InitJNIEnv();
   InitJavaVM();
   find_exidx_bounds(SO_PATH);
+  trace("[ff6] exidx vaddr=0x%x size=0x%x\n", (unsigned)exidx_vaddr,
+         (unsigned)exidx_size);
 
+  trace("[ff6] so_load...\n");
   if (so_load(&ff6_mod, SO_PATH, LOAD_ADDRESS) < 0)
     fatal_error("Error could not load %s.", SO_PATH);
+  trace("[ff6] loaded text=0x%x (%u) data=0x%x (%u)\n",
+         (unsigned)ff6_mod.text_base, (unsigned)ff6_mod.text_size,
+         (unsigned)ff6_mod.data_base, (unsigned)ff6_mod.data_size);
 
+  trace("[ff6] so_relocate...\n");
   so_relocate(&ff6_mod);
+  trace("[ff6] so_resolve...\n");
   so_resolve(&ff6_mod, default_dynlib, sizeof(default_dynlib), 0);
+  trace("[ff6] patch_game...\n");
   patch_game();
   so_flush_caches(&ff6_mod);
 
+  trace("[ff6] so_initialize...\n");
   so_initialize(&ff6_mod);
+  trace("[ff6] module ready\n");
 
   SceUID thid =
       sceKernelCreateThread("ff6_main", (SceKernelThreadEntry)main_thread, 0x40,
