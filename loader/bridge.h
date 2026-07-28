@@ -51,6 +51,9 @@ int getSystemLanguage(void);
 const char *getDataDirectory(void);
 const char *getObbDirectory(void);
 int64_t getHeapSize(void);
+int getBatteryInfo(void);
+int getClockTime(void);
+int isAndroidTV(void);
 void getTerminalTimeFormat(jni_bytearray *out, int64_t millis);
 
 /* --------------------------------------------------------------------------
@@ -63,5 +66,7 @@ void setInputText(const char *text);
 void setLimitInputText(int limit);
 void setClipBoardCopy(const char *text);
 int isInputDialogOpen(void);
+
+void trace(const char *fmt, ...);
 
 #endif

@@ -139,37 +139,23 @@ static void loadOptions(void) {
  * Trivial libc / logging shims
  * ======================================================================== */
 
-/* Boot tracing: the emulator buffers tty output, so a host-side crash loses it.
- * Writing through sceIo and closing every time survives anything. */
-static void trace(const char *fmt, ...) {
-  char line[256];
-  va_list list;
-
-  va_start(list, fmt);
-  int len = vsnprintf(line, sizeof(line), fmt, list);
-  va_end(list);
-
-  if (len < 0)
-    return;
-  if (len > (int)sizeof(line) - 1)
-    len = sizeof(line) - 1;
-
-  sceClibPrintf("%s", line);
-
-  SceUID fd = sceIoOpen(DATA_PATH "/boot.log",
-                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-  if (fd < 0)
-    return;
-  sceIoWrite(fd, line, len);
-  sceIoClose(fd);
-}
-
 static int ret0(void) { return 0; }
 static int ret1(void) { return 1; }
 static void *retNULL(void) { return NULL; }
 
+static const char *log_prio_name(int prio) {
+  switch (prio) {
+  case 2: return "V";
+  case 3: return "D";
+  case 4: return "I";
+  case 5: return "W";
+  case 6: return "E";
+  case 7: return "F";
+  default: return "?";
+  }
+}
+
 int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
-#ifdef DEBUG
   va_list list;
   char string[512];
 
@@ -177,8 +163,12 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...) {
   vsnprintf(string, sizeof(string), fmt, list);
   va_end(list);
 
-  printf("[%s] %s\n", tag, string);
-#endif
+  trace("[%s/%s] %s\n", log_prio_name(prio), tag ? tag : "?", string);
+  return 0;
+}
+
+static int puts_hook(const char *s) {
+  trace("[puts] %s\n", s ? s : "(null)");
   return 0;
 }
 
@@ -203,11 +193,9 @@ static int fprintf_hook(FILE *stream, const char *fmt, ...) {
 
   va_start(list, fmt);
   if (is_fake_stdio(stream)) {
-#ifdef DEBUG
-    ret = vprintf(fmt, list);
-#else
-    ret = 0;
-#endif
+    char string[512];
+    ret = vsnprintf(string, sizeof(string), fmt, list);
+    trace("[stdio] %s", string);
   } else {
     ret = vfprintf(stream, fmt, list);
   }
@@ -226,6 +214,30 @@ static int fflush_hook(FILE *stream) {
   if (!stream || is_fake_stdio(stream))
     return 0;
   return fflush(stream);
+}
+
+/* Own sleep primitives rather than newlib's: its usleep is a thin wrapper that
+ * we would otherwise have to trust to be linked against the same stub set. */
+static int usleep_fake(unsigned int usec) {
+  if (usec)
+    sceKernelDelayThread(usec);
+  return 0;
+}
+
+static unsigned int sleep_fake(unsigned int seconds) {
+  if (seconds)
+    sceKernelDelayThread(seconds * 1000000);
+  return 0;
+}
+
+static int nanosleep_fake(const struct timespec *req, struct timespec *rem) {
+  if (req)
+    sceKernelDelayThread(req->tv_sec * 1000000 + req->tv_nsec / 1000);
+  if (rem) {
+    rem->tv_sec = 0;
+    rem->tv_nsec = 0;
+  }
+  return 0;
 }
 
 static void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd,
@@ -451,9 +463,29 @@ static int pthread_cond_wait_fake(pthread_cond_t **cnd,
   return pthread_cond_wait(*cnd, *mtx);
 }
 
-static int pthread_create_fake(pthread_t *thread, const void *attr, void *entry,
-                               void *arg) {
-  return pthread_create(thread, NULL, (void *(*)(void *))entry, arg);
+/* Android gives every thread a 1 MB stack by default and the .so relies on it:
+ * thread_main runs the whole game (AgbMain, the renderer, the event VM) on the
+ * thread it is handed. pthreads-embedded defaults to far less, which shows up
+ * as a return address popped as 0 somewhere deep in the call chain rather than
+ * as an honest overflow. Ask for the same 1 MB Android would have given. */
+#define SO_THREAD_STACK_SIZE (1024 * 1024)
+
+static int pthread_create_fake(pthread_t *thread, const void *unused,
+                               void *entry, void *arg) {
+  pthread_attr_t attr;
+
+  if (pthread_attr_init(&attr) != 0)
+    return pthread_create(thread, NULL, (void *(*)(void *))entry, arg);
+
+  pthread_attr_setstacksize(&attr, SO_THREAD_STACK_SIZE);
+
+  int ret = pthread_create(thread, &attr, (void *(*)(void *))entry, arg);
+  pthread_attr_destroy(&attr);
+
+  if (ret != 0)
+    ret = pthread_create(thread, NULL, (void *(*)(void *))entry, arg);
+
+  return ret;
 }
 
 static int pthread_attr_init_fake(void *attr) { return 0; }
@@ -481,6 +513,9 @@ enum MethodIDs {
   GET_HEAP_SIZE,
   GET_CURRENT_TIME_MILLIS,
   GET_TERMINAL_TIME_FORMAT,
+  GET_BATTERY_INFO,
+  GET_CLOCK_TIME,
+  IS_ANDROID_TV,
   /* software keyboard */
   OPEN_INPUT_DIALOG,
   GET_INPUT_TEXT,
@@ -513,6 +548,9 @@ static NameToMethodID name_to_method_ids[] = {
     {"getHeapSize", GET_HEAP_SIZE},
     {"getCurrentTimeMillis", GET_CURRENT_TIME_MILLIS},
     {"getTerminalTimeFormat", GET_TERMINAL_TIME_FORMAT},
+    {"getBatteryInfo", GET_BATTERY_INFO},
+    {"getClockTime", GET_CLOCK_TIME},
+    {"IsAndroidTV", IS_ANDROID_TV},
     {"OpenInputDialog", OPEN_INPUT_DIALOG},
     {"GetInputText", GET_INPUT_TEXT},
     {"SetInputText", SET_INPUT_TEXT},
@@ -523,27 +561,52 @@ static NameToMethodID name_to_method_ids[] = {
     {"IsKeyguardDisp", IS_KEYGUARD_DISP},
 };
 
-static int lookup_method(const char *name) {
+static const char *method_name(int id) {
+  for (size_t i = 0; i < sizeof(name_to_method_ids) / sizeof(NameToMethodID);
+       i++) {
+    if (name_to_method_ids[i].id == id)
+      return name_to_method_ids[i].name;
+  }
+  return "?";
+}
+
+/* Report anything the game asks for that we do not implement: an unknown name
+ * means a missing entry in the table, an unhandled id means the name resolved
+ * but the matching Call*Method dispatcher has no case for it. Both show up as
+ * a silently wrong return value otherwise. */
+static void report_unhandled(const char *kind, int id) {
+  static int seen[64];
+  static int seen_count;
+
+  for (int i = 0; i < seen_count; i++) {
+    if (seen[i] == id)
+      return;
+  }
+  if (seen_count < (int)(sizeof(seen) / sizeof(seen[0])))
+    seen[seen_count++] = id;
+
+  trace("[jni] UNHANDLED %s id=%d (%s)\n", kind, id, method_name(id));
+}
+
+static int lookup_method(const char *name, const char *sig) {
   for (size_t i = 0; i < sizeof(name_to_method_ids) / sizeof(NameToMethodID);
        i++) {
     if (strcmp(name, name_to_method_ids[i].name) == 0)
       return name_to_method_ids[i].id;
   }
 
-#ifdef DEBUG
-  printf("unhandled JNI method: %s\n", name);
-#endif
+  trace("[jni] UNKNOWN method %s%s\n", name, sig ? sig : "");
   return UNKNOWN;
 }
 
 static int GetMethodID(void *env, void *clazz, const char *name,
                        const char *sig) {
-  return lookup_method(name);
+  return lookup_method(name, sig);
 }
 
 static int GetStaticMethodID(void *env, void *clazz, const char *name,
                              const char *sig) {
-  return lookup_method(name);
+  return lookup_method(name, sig);
 }
 
 /* Local references
@@ -596,7 +659,11 @@ static void CallVoidMethodV(void *env, void *obj, int methodID,
   case SET_CLIPBOARD_COPY:
     setClipBoardCopy((const char *)args[0]);
     break;
+  case SET_SUSPEND_TASK:
+  case ABORT_PAUSE_TO_RESUME:
+    break;
   default:
+    report_unhandled("void", methodID);
     break;
   }
 }
@@ -636,7 +703,12 @@ static int CallIntMethodV(void *env, void *obj, int methodID,
     return getTextFontSize((int)args[0]);
   case GET_SYSTEM_LANGUAGE:
     return getSystemLanguage();
+  case GET_BATTERY_INFO:
+    return getBatteryInfo();
+  case GET_CLOCK_TIME:
+    return getClockTime();
   default:
+    report_unhandled("int", methodID);
     return 0;
   }
 }
@@ -657,6 +729,7 @@ static int64_t CallLongMethodV(void *env, void *obj, int methodID,
     return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
   }
   default:
+    report_unhandled("long", methodID);
     return 0;
   }
 }
@@ -668,9 +741,14 @@ static int64_t CallStaticLongMethodV(void *env, void *clazz, int methodID,
 
 static char *NewStringUTF(void *env, const char *bytes);
 
+/* Every object-returning method lives here, static or not: FF6.java mixes the
+ * two (getTextImg() is an instance method reached through GetMethodID, while
+ * the setText*() family is static) and the method IDs are unique anyway. */
 static void *CallObjectMethodV(void *env, void *obj, int methodID,
                                uintptr_t *args) {
   switch (methodID) {
+  case GET_TEXT_IMG:
+    return getTextImg();
   case GET_DATA_DIRECTORY:
     return NewStringUTF(env, getDataDirectory());
   case GET_OBB_DIRECTORY:
@@ -678,18 +756,14 @@ static void *CallObjectMethodV(void *env, void *obj, int methodID,
   case GET_INPUT_TEXT:
     return NewStringUTF(env, getInputText());
   default:
+    report_unhandled("object", methodID);
     return NULL;
   }
 }
 
 static void *CallStaticObjectMethodV(void *env, void *clazz, int methodID,
                                      uintptr_t *args) {
-  switch (methodID) {
-  case GET_TEXT_IMG:
-    return getTextImg();
-  default:
-    return CallObjectMethodV(env, clazz, methodID, args);
-  }
+  return CallObjectMethodV(env, clazz, methodID, args);
 }
 
 static int CallBooleanMethodV(void *env, void *obj, int methodID,
@@ -697,7 +771,10 @@ static int CallBooleanMethodV(void *env, void *obj, int methodID,
   switch (methodID) {
   case IS_KEYGUARD_DISP:
     return 0;
+  case IS_ANDROID_TV:
+    return isAndroidTV();
   default:
+    report_unhandled("boolean", methodID);
     return 0;
   }
 }
@@ -817,6 +894,55 @@ static void SetByteArrayRegion(void *env, jni_bytearray *array, size_t start,
     memcpy(array->elements + start, buf, len);
 }
 
+/* The .so reaches JNIEnv both ways: its C++ wrapper class funnels through the
+ * ...MethodV slots, but plenty of call sites index the plain variadic slot
+ * directly (IsAndroidTV loads env+0x94, CallBooleanMethod). Leaving those NULL
+ * shows up as a jump to 0, so every variadic entry gets a trampoline that
+ * hands the va_list on to the V implementation -- which is what the wrapper
+ * would have done anyway. */
+#define JNI_VARIADIC_TRAMPOLINE(ret_type, name)                                \
+  static ret_type name(void *env, void *obj, int methodID, ...) {              \
+    va_list list;                                                              \
+    va_start(list, methodID);                                                  \
+    ret_type ret = name##V(env, obj, methodID, *(uintptr_t **)&list);             \
+    va_end(list);                                                              \
+    return ret;                                                                \
+  }
+
+JNI_VARIADIC_TRAMPOLINE(void *, CallObjectMethod)
+JNI_VARIADIC_TRAMPOLINE(int, CallBooleanMethod)
+JNI_VARIADIC_TRAMPOLINE(int, CallIntMethod)
+JNI_VARIADIC_TRAMPOLINE(int64_t, CallLongMethod)
+JNI_VARIADIC_TRAMPOLINE(void *, CallStaticObjectMethod)
+JNI_VARIADIC_TRAMPOLINE(int, CallStaticBooleanMethod)
+JNI_VARIADIC_TRAMPOLINE(int, CallStaticIntMethod)
+JNI_VARIADIC_TRAMPOLINE(int64_t, CallStaticLongMethod)
+
+/* void returns cannot go through the macro's `return ret`. */
+static void CallVoidMethod(void *env, void *obj, int methodID, ...) {
+  va_list list;
+  va_start(list, methodID);
+  CallVoidMethodV(env, obj, methodID, *(uintptr_t **)&list);
+  va_end(list);
+}
+
+static void CallStaticVoidMethod(void *env, void *clazz, int methodID, ...) {
+  va_list list;
+  va_start(list, methodID);
+  CallStaticVoidMethodV(env, clazz, methodID, *(uintptr_t **)&list);
+  va_end(list);
+}
+
+static SOFTFP_ABI float CallFloatMethod(void *env, void *obj, int methodID,
+                                        ...) {
+  return 0.0f;
+}
+
+static SOFTFP_ABI float CallStaticFloatMethod(void *env, void *clazz,
+                                              int methodID, ...) {
+  return 0.0f;
+}
+
 static char fake_env[0x1000];
 
 static void InitJNIEnv(void) {
@@ -828,19 +954,31 @@ static void InitJNIEnv(void) {
   *(uintptr_t *)(fake_env + 0x74) = (uintptr_t)NewObjectV;
   *(uintptr_t *)(fake_env + 0x7C) = (uintptr_t)GetObjectClass;
   *(uintptr_t *)(fake_env + 0x84) = (uintptr_t)GetMethodID;
+  *(uintptr_t *)(fake_env + 0x88) = (uintptr_t)CallObjectMethod;
   *(uintptr_t *)(fake_env + 0x8C) = (uintptr_t)CallObjectMethodV;
+  *(uintptr_t *)(fake_env + 0x94) = (uintptr_t)CallBooleanMethod;
   *(uintptr_t *)(fake_env + 0x98) = (uintptr_t)CallBooleanMethodV;
+  *(uintptr_t *)(fake_env + 0xC4) = (uintptr_t)CallIntMethod;
   *(uintptr_t *)(fake_env + 0xC8) = (uintptr_t)CallIntMethodV;
+  *(uintptr_t *)(fake_env + 0xD0) = (uintptr_t)CallLongMethod;
   *(uintptr_t *)(fake_env + 0xD4) = (uintptr_t)CallLongMethodV;
+  *(uintptr_t *)(fake_env + 0xDC) = (uintptr_t)CallFloatMethod;
   *(uintptr_t *)(fake_env + 0xE0) = (uintptr_t)CallFloatMethodV;
+  *(uintptr_t *)(fake_env + 0xF4) = (uintptr_t)CallVoidMethod;
   *(uintptr_t *)(fake_env + 0xF8) = (uintptr_t)CallVoidMethodV;
   *(uintptr_t *)(fake_env + 0x178) = (uintptr_t)GetFieldID;
   *(uintptr_t *)(fake_env + 0x1C4) = (uintptr_t)GetStaticMethodID;
+  *(uintptr_t *)(fake_env + 0x1C8) = (uintptr_t)CallStaticObjectMethod;
   *(uintptr_t *)(fake_env + 0x1CC) = (uintptr_t)CallStaticObjectMethodV;
+  *(uintptr_t *)(fake_env + 0x1D4) = (uintptr_t)CallStaticBooleanMethod;
   *(uintptr_t *)(fake_env + 0x1D8) = (uintptr_t)CallStaticBooleanMethodV;
+  *(uintptr_t *)(fake_env + 0x204) = (uintptr_t)CallStaticIntMethod;
   *(uintptr_t *)(fake_env + 0x208) = (uintptr_t)CallStaticIntMethodV;
+  *(uintptr_t *)(fake_env + 0x210) = (uintptr_t)CallStaticLongMethod;
   *(uintptr_t *)(fake_env + 0x214) = (uintptr_t)CallStaticLongMethodV;
+  *(uintptr_t *)(fake_env + 0x21C) = (uintptr_t)CallStaticFloatMethod;
   *(uintptr_t *)(fake_env + 0x220) = (uintptr_t)CallStaticFloatMethodV;
+  *(uintptr_t *)(fake_env + 0x234) = (uintptr_t)CallStaticVoidMethod;
   *(uintptr_t *)(fake_env + 0x238) = (uintptr_t)CallStaticVoidMethodV;
   *(uintptr_t *)(fake_env + 0x240) = (uintptr_t)GetStaticFieldID;
   *(uintptr_t *)(fake_env + 0x244) = (uintptr_t)GetStaticObjectField;
@@ -1405,12 +1543,12 @@ static so_default_dynlib default_dynlib[] = {
     {"mmap", (uintptr_t)&mmap_fake},
     {"modf", WRAP((double (*)(double, double *))modf)},
     {"munmap", (uintptr_t)&munmap_fake},
-    {"nanosleep", (uintptr_t)&nanosleep},
+    {"nanosleep", (uintptr_t)&nanosleep_fake},
     {"open", (uintptr_t)&open},
     {"pipe", (uintptr_t)&ret0},
     {"pow", WRAP((double (*)(double, double))pow)},
     {"powf", WRAP(powf)},
-    {"puts", (uintptr_t)&puts},
+    {"puts", (uintptr_t)&puts_hook},
     {"qsort", (uintptr_t)&qsort},
     {"raise", (uintptr_t)&raise},
     {"read", (uintptr_t)&read},
@@ -1419,7 +1557,7 @@ static so_default_dynlib default_dynlib[] = {
     {"setjmp", (uintptr_t)&setjmp},
     {"sin", WRAP((double (*)(double))sin)},
     {"sinf", WRAP(sinf)},
-    {"sleep", (uintptr_t)&sleep},
+    {"sleep", (uintptr_t)&sleep_fake},
     {"snprintf", (uintptr_t)&snprintf},
     {"sprintf", (uintptr_t)&sprintf},
     {"sqrt", WRAP((double (*)(double))sqrt)},
@@ -1441,7 +1579,7 @@ static so_default_dynlib default_dynlib[] = {
     {"strtol", (uintptr_t)&strtol},
     {"tanf", WRAP(tanf)},
     {"time", (uintptr_t)&time},
-    {"usleep", (uintptr_t)&usleep},
+    {"usleep", (uintptr_t)&usleep_fake},
     {"vsprintf", (uintptr_t)&vsprintf},
     {"write", (uintptr_t)&write},
 
@@ -1690,6 +1828,9 @@ static int main_thread(SceSize args, void *argp) {
   *engine_field(ENGINE_SCREEN_W) = SCREEN_W;
   *engine_field(ENGINE_SCREEN_H) = SCREEN_H;
 
+  trace("[ff6] got[usleep]=0x%x before initGame\n",
+        *(unsigned int *)(ff6_mod.text_base + 0x1513ef8));
+
   /* initGame() spawns thread_main, which owns EGL/GL and runs AgbMain. */
   trace("[ff6] initGame...\n");
   ff6_initGame();
@@ -1699,9 +1840,11 @@ static int main_thread(SceSize args, void *argp) {
     ff6_inputGamePadSetActive(1);
 
   /* Same job the glue's main thread had: feed input, nothing else. */
-  while (1) {
+  for (int tick = 0;; tick++) {
     pump_buttons();
     pump_touch();
+    if (tick % 250 == 0)
+      trace("[ff6] input loop alive, tick %d\n", tick);
     sceKernelDelayThread(4000);
   }
 

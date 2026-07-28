@@ -21,6 +21,7 @@
 
 #include "main.h"
 #include "dialog.h"
+#include "bridge.h"
 #include "so_util.h"
 
 static so_module *head = NULL, *tail = NULL;
@@ -85,6 +86,7 @@ int so_load(so_module *mod, const char *filename, uintptr_t load_addr) {
   }
 
   sceKernelGetMemBlockBase(so_blockid, &so_data);
+  trace("[so] file block %p size 0x%x\n", so_data, (unsigned)so_size);
 
   if (sceIoRead(fd, so_data, so_size) != (SceSSize)so_size) {
     sceIoClose(fd);
@@ -152,16 +154,36 @@ int so_load(so_module *mod, const char *filename, uintptr_t load_addr) {
         mod->data_size = mod->phdr[i].p_memsz;
       }
 
-      char *zero = malloc(prog_size);
-      if (!zero) {
-        res = -1;
-        goto err_free_data;
+      trace("[so] seg %d %s base=%p size=0x%x\n", i,
+            (mod->phdr[i].p_flags & PF_X) == PF_X ? "rx" : "rw", prog_data,
+            (unsigned)prog_size);
+
+      /* Zero the segment in chunks: libFF6.so's text segment alone is ~21 MB,
+         and a temporary buffer that size is a needless spike on the heap. */
+      #define SO_ZERO_CHUNK (256 * 1024)
+      {
+        size_t chunk = prog_size < SO_ZERO_CHUNK ? prog_size : SO_ZERO_CHUNK;
+        char *zero = malloc(chunk);
+        if (!zero) {
+          res = -1;
+          goto err_free_data;
+        }
+        memset(zero, 0, chunk);
+        for (size_t off = 0; off < prog_size; off += chunk) {
+          size_t n = prog_size - off;
+          if (n > chunk)
+            n = chunk;
+          kuKernelCpuUnrestrictedMemcpy((char *)prog_data + off, zero, n);
+        }
+        free(zero);
       }
-      memset(zero, 0, prog_size);
-      kuKernelCpuUnrestrictedMemcpy(prog_data, zero, prog_size);
-      free(zero);
+
+      trace("[so] seg %d zeroed, copying 0x%x bytes to %p\n", i,
+            (unsigned)mod->phdr[i].p_filesz, (void *)mod->phdr[i].p_vaddr);
 
       kuKernelCpuUnrestrictedMemcpy((void *)mod->phdr[i].p_vaddr, (void *)((uintptr_t)so_data + mod->phdr[i].p_offset), mod->phdr[i].p_filesz);
+
+      trace("[so] seg %d copied\n", i);
     }
   }
 
@@ -210,6 +232,7 @@ int so_load(so_module *mod, const char *filename, uintptr_t load_addr) {
     }
   }
 
+  trace("[so] sections parsed, freeing staging block\n");
   sceKernelFreeMemBlock(so_blockid);
 
   if (!head && !tail) {

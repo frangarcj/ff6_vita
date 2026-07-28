@@ -21,6 +21,41 @@
 #include "config.h"
 #include "dialog.h"
 
+#include <stdarg.h>
+
+/* Boot tracing: the emulator buffers tty output, so a host-side crash loses it.
+ * Writing through sceIo and closing every time survives anything. */
+void trace(const char *fmt, ...) {
+  char line[256];
+  va_list list;
+
+  va_start(list, fmt);
+  int len = vsnprintf(line, sizeof(line), fmt, list);
+  va_end(list);
+
+  if (len < 0)
+    return;
+  if (len > (int)sizeof(line) - 1)
+    len = sizeof(line) - 1;
+
+  char tagged[288];
+  int tlen = snprintf(tagged, sizeof(tagged), "[t%08x] %s",
+                      (unsigned)sceKernelGetThreadId(), line);
+  if (tlen < 0)
+    return;
+  if (tlen > (int)sizeof(tagged) - 1)
+    tlen = sizeof(tagged) - 1;
+
+  sceClibPrintf("%s", tagged);
+
+  SceUID fd = sceIoOpen(DATA_PATH "/boot.log",
+                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+  if (fd < 0)
+    return;
+  sceIoWrite(fd, tagged, tlen);
+  sceIoClose(fd);
+}
+
 /* ==========================================================================
  * Font handling
  * ======================================================================== */
@@ -65,9 +100,14 @@ static int init_font(void) {
   unload_font();
   font_language = language;
 
-  FILE *f = fopen(font_path_for_language(language), "rb");
-  if (!f)
+  const char *path = font_path_for_language(language);
+  trace("[font] lang=%d opening %s\n", language, path);
+
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    trace("[font] fopen failed\n");
     return 0;
+  }
 
   fseek(f, 0, SEEK_END);
   long size = ftell(f);
@@ -77,8 +117,10 @@ static int init_font(void) {
     return 0;
   }
 
+  trace("[font] size=%ld, allocating\n", size);
   font_buffer = malloc(size);
   if (!font_buffer) {
+    trace("[font] malloc failed\n");
     fclose(f);
     return 0;
   }
@@ -96,11 +138,14 @@ static int init_font(void) {
     return 0;
   }
 
+  trace("[font] read ok, stbtt_InitFont...\n");
   if (!stbtt_InitFont(font_info, font_buffer, 0)) {
+    trace("[font] stbtt_InitFont failed\n");
     unload_font();
     return 0;
   }
 
+  trace("[font] ready\n");
   return 1;
 }
 
@@ -399,7 +444,11 @@ int getSystemLanguage(void) {
   }
 }
 
-const char *getDataDirectory(void) { return SAVE_PATH; }
+const char *getDataDirectory(void) {
+  /* Trailing slash matters: the .so appends "RockDat%d.sav" straight onto this
+     with no separator (its built-in fallback is the literal "/sdcard/"). */
+  return SAVE_PATH "/";
+}
 
 const char *getObbDirectory(void) {
   /* Java returns the full path of the .obb file, not the directory holding it
@@ -416,6 +465,42 @@ int64_t getHeapSize(void) {
 
   return (int64_t)64 * 1024 * 1024;
 }
+
+/* Percentage in 0..100, offset by 1000 while charging and 2000 when full --
+ * the game draws its iPhone-style status bar straight from this. */
+int getBatteryInfo(void) {
+  int percent = scePowerGetBatteryLifePercent();
+  if (percent < 0)
+    percent = 100;
+
+  if (percent > 100)
+    percent = 100;
+  if (percent < 0)
+    percent = 0;
+
+  if (percent == 100 && scePowerIsBatteryCharging())
+    return percent + 2000;
+  if (scePowerIsBatteryCharging())
+    return percent + 1000;
+
+  return percent;
+}
+
+/* hour * 100 + minute, local time. */
+int getClockTime(void) {
+  SceDateTime time;
+
+  if (sceRtcGetCurrentClockLocalTime(&time) < 0)
+    return 0;
+
+  return time.hour * 100 + time.minute;
+}
+
+/* Tempting to answer yes -- a Vita has a real d-pad, and that is what FF3 does
+ * -- but the .so's TV branch calls further into the activity and crashes here,
+ * so report a phone. Our synthesized key events reach InputDriverAndroid
+ * either way; the virtual pad is dealt with separately. */
+int isAndroidTV(void) { return 0; }
 
 void getTerminalTimeFormat(jni_bytearray *out, int64_t millis) {
   if (!out || !out->elements || out->size <= 0)
