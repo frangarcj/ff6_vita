@@ -105,6 +105,7 @@ static void set_default_options(void) {
   options.lang = 0;
   options.msaa = 2;
   options.aspect = 0;
+  options.sound = 1;
 }
 
 static void loadOptions(void) {
@@ -130,6 +131,8 @@ static void loadOptions(void) {
       options.msaa = value;
     else if (strcmp("aspect", key) == 0)
       options.aspect = value;
+    else if (strcmp("sound", key) == 0)
+      options.sound = value;
   }
 
   fclose(f);
@@ -1240,6 +1243,8 @@ static SOFTFP_ABI float AMotionEvent_getY(const void *e, size_t index) {
  * EGL over vitaGL
  * ======================================================================== */
 
+static void gl_stats_report(void);
+
 #define FAKE_EGL_DISPLAY ((void *)0xE9100001)
 #define FAKE_EGL_SURFACE ((void *)0xE9100002)
 #define FAKE_EGL_CONTEXT ((void *)0xE9100003)
@@ -1313,6 +1318,8 @@ static unsigned fake_eglQuerySurface(void *dpy, void *surface, int attribute,
 }
 
 static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
+  gl_stats_report();
+
   /* The IME dialog has to be composited by the Vita's own display stack, so we
    * ask vitaGL to keep the framebuffer around while it is up. */
   vglSwapBuffers(isInputDialogOpen() ? GL_TRUE : GL_FALSE);
@@ -1348,6 +1355,136 @@ static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
 /* vitaGL has no fixed-function light model; the game only ever sets the global
  * ambient, which we can safely ignore. */
 static SOFTFP_ABI void glLightModelf(GLenum pname, GLfloat param) {}
+
+/* Experiment hook: with options.sound == 0 we refuse to create the OpenSL ES
+ * engine, which is the quickest way to tell whether the game's clock is gated
+ * on the sound system coming up. */
+static SLresult slCreateEngineHook(SLObjectItf *engine, SLuint32 numOptions,
+                                   const SLEngineOption *options_,
+                                   SLuint32 numInterfaces,
+                                   const SLInterfaceID *ids,
+                                   const SLboolean *req) {
+  if (!options.sound) {
+    trace("[snd] slCreateEngine refused (sound disabled)\n");
+    return SL_RESULT_FEATURE_UNSUPPORTED;
+  }
+  return slCreateEngine(engine, numOptions, options_, numInterfaces, ids, req);
+}
+
+/* ==========================================================================
+ * GL instrumentation
+ *
+ * Every GL entry point the .so can reach is ours, so counting them is the
+ * cheapest way to see what the game actually submits per frame without
+ * patching a single byte of the module.
+ * ======================================================================== */
+
+static GLuint gl_bound_texture;
+
+static struct {
+  unsigned frames;
+  unsigned draws;
+  unsigned clears;
+  unsigned textures;
+  unsigned tex_subs;
+  unsigned binds;
+  int last_viewport[4];
+  float last_ortho[6];
+  unsigned draws_this_frame;
+  unsigned max_draws;
+} gl_stats;
+
+static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
+  gl_stats.draws++;
+  gl_stats.draws_this_frame++;
+
+  /* Dump one settled frame's worth of draw calls: which texture, how many
+     vertices. That is enough to tell a UI overlay from a real scene. */
+  if (gl_stats.frames == 300)
+    trace("[gl] draw #%u mode=0x%x first=%d count=%d tex=%u\n",
+          gl_stats.draws_this_frame, mode, first, count, gl_bound_texture);
+
+  glDrawArrays(mode, first, count);
+}
+
+static void glClearHook(GLbitfield mask) {
+  gl_stats.clears++;
+  glClear(mask);
+}
+
+static void glViewportHook(GLint x, GLint y, GLsizei w, GLsizei h) {
+  gl_stats.last_viewport[0] = x;
+  gl_stats.last_viewport[1] = y;
+  gl_stats.last_viewport[2] = w;
+  gl_stats.last_viewport[3] = h;
+  glViewport(x, y, w, h);
+}
+
+static SOFTFP_ABI void glOrthofHook(GLfloat l, GLfloat r, GLfloat b, GLfloat t,
+                                    GLfloat n, GLfloat f) {
+  gl_stats.last_ortho[0] = l;
+  gl_stats.last_ortho[1] = r;
+  gl_stats.last_ortho[2] = b;
+  gl_stats.last_ortho[3] = t;
+  gl_stats.last_ortho[4] = n;
+  gl_stats.last_ortho[5] = f;
+  glOrthof(l, r, b, t, n, f);
+}
+
+static void glTexImage2DHook(GLenum target, GLint level, GLint internalformat,
+                             GLsizei width, GLsizei height, GLint border,
+                             GLenum format, GLenum type, const void *pixels) {
+  gl_stats.textures++;
+  trace("[gl] tex #%u id=%u %dx%d ifmt=0x%x fmt=0x%x type=0x%x%s\n",
+        gl_stats.textures, gl_bound_texture, width, height, internalformat,
+        format, type, pixels ? "" : " (empty)");
+  glTexImage2D(target, level, internalformat, width, height, border, format,
+               type, pixels);
+}
+
+static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
+                                GLint yoffset, GLsizei width, GLsizei height,
+                                GLenum format, GLenum type,
+                                const void *pixels) {
+  gl_stats.tex_subs++;
+  glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
+                  pixels);
+}
+
+static void glBindTextureHook(GLenum target, GLuint texture) {
+  gl_stats.binds++;
+  gl_bound_texture = texture;
+  glBindTexture(target, texture);
+}
+
+static void glCompressedTexImage2DHook(GLenum target, GLint level,
+                                       GLenum internalformat, GLsizei width,
+                                       GLsizei height, GLint border,
+                                       GLsizei imageSize, const void *data) {
+  trace("[gl] compressed tex fmt=0x%x %dx%d size=%d\n", internalformat, width,
+        height, imageSize);
+  glCompressedTexImage2D(target, level, internalformat, width, height, border,
+                         imageSize, data);
+}
+
+static void gl_stats_report(void) {
+  gl_stats.frames++;
+  if (gl_stats.draws_this_frame > gl_stats.max_draws)
+    gl_stats.max_draws = gl_stats.draws_this_frame;
+  gl_stats.draws_this_frame = 0;
+
+  if (gl_stats.frames % 60)
+    return;
+
+  trace("[gl] frame %u draws=%u (max/frame %u) clears=%u tex=%u sub=%u "
+        "binds=%u vp=%d,%d %dx%d ortho=%d..%d,%d..%d\n",
+        gl_stats.frames, gl_stats.draws, gl_stats.max_draws, gl_stats.clears,
+        gl_stats.textures, gl_stats.tex_subs, gl_stats.binds,
+        gl_stats.last_viewport[0], gl_stats.last_viewport[1],
+        gl_stats.last_viewport[2], gl_stats.last_viewport[3],
+        (int)gl_stats.last_ortho[0], (int)gl_stats.last_ortho[1],
+        (int)gl_stats.last_ortho[2], (int)gl_stats.last_ortho[3]);
+}
 
 /* ==========================================================================
  * Symbol table
@@ -1404,7 +1541,7 @@ static so_default_dynlib default_dynlib[] = {
     {"SL_IID_ENGINE", (uintptr_t)&SL_IID_ENGINE},
     {"SL_IID_PLAY", (uintptr_t)&SL_IID_PLAY},
     {"SL_IID_VOLUME", (uintptr_t)&SL_IID_VOLUME},
-    {"slCreateEngine", (uintptr_t)&slCreateEngine},
+    {"slCreateEngine", (uintptr_t)&slCreateEngineHook},
 
     /* EGL */
     {"eglChooseConfig", (uintptr_t)&fake_eglChooseConfig},
@@ -1423,22 +1560,22 @@ static so_default_dynlib default_dynlib[] = {
     /* GLES 1.x */
     {"glActiveTexture", (uintptr_t)&glActiveTexture},
     {"glAlphaFunc", WRAP(glAlphaFunc)},
-    {"glBindTexture", (uintptr_t)&glBindTexture},
+    {"glBindTexture", (uintptr_t)&glBindTextureHook},
     {"glBlendFunc", (uintptr_t)&glBlendFunc},
-    {"glClear", (uintptr_t)&glClear},
+    {"glClear", (uintptr_t)&glClearHook},
     {"glClearColor", WRAP(glClearColor)},
     {"glClearDepthf", WRAP(glClearDepthf)},
     {"glColor4f", WRAP(glColor4f)},
     {"glColorMask", (uintptr_t)&glColorMask},
     {"glColorPointer", (uintptr_t)&glColorPointer},
-    {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2D},
+    {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook},
     {"glCullFace", (uintptr_t)&glCullFace},
     {"glDeleteTextures", (uintptr_t)&glDeleteTextures},
     {"glDepthFunc", (uintptr_t)&glDepthFunc},
     {"glDepthMask", (uintptr_t)&glDepthMask},
     {"glDisable", (uintptr_t)&glDisable},
     {"glDisableClientState", (uintptr_t)&glDisableClientState},
-    {"glDrawArrays", (uintptr_t)&glDrawArrays},
+    {"glDrawArrays", (uintptr_t)&glDrawArraysHook},
     {"glEnable", (uintptr_t)&glEnable},
     {"glEnableClientState", (uintptr_t)&glEnableClientState},
     {"glFogf", WRAP(glFogf)},
@@ -1458,7 +1595,7 @@ static so_default_dynlib default_dynlib[] = {
     {"glMatrixMode", (uintptr_t)&glMatrixMode},
     {"glMultMatrixf", (uintptr_t)&glMultMatrixf},
     {"glNormalPointer", (uintptr_t)&glNormalPointer},
-    {"glOrthof", WRAP(glOrthof)},
+    {"glOrthof", (uintptr_t)&glOrthofHook},
     {"glPopMatrix", (uintptr_t)&glPopMatrix},
     {"glPushMatrix", (uintptr_t)&glPushMatrix},
     {"glRotatef", WRAP(glRotatef)},
@@ -1467,13 +1604,13 @@ static so_default_dynlib default_dynlib[] = {
     {"glShadeModel", (uintptr_t)&glShadeModel},
     {"glTexCoordPointer", (uintptr_t)&glTexCoordPointer},
     {"glTexEnvf", WRAP(glTexEnvf)},
-    {"glTexImage2D", (uintptr_t)&glTexImage2D},
+    {"glTexImage2D", (uintptr_t)&glTexImage2DHook},
     {"glTexParameterf", (uintptr_t)&glTexParameterfHook},
     {"glTexParameteri", (uintptr_t)&glTexParameteriHook},
-    {"glTexSubImage2D", (uintptr_t)&glTexSubImage2D},
+    {"glTexSubImage2D", (uintptr_t)&glTexSubImage2DHook},
     {"glTranslatef", WRAP(glTranslatef)},
     {"glVertexPointer", (uintptr_t)&glVertexPointer},
-    {"glViewport", (uintptr_t)&glViewport},
+    {"glViewport", (uintptr_t)&glViewportHook},
 
     /* zlib */
     {"adler32", (uintptr_t)&adler32},
@@ -1623,6 +1760,25 @@ static int (*ff6_InputDriverAndroid_onInputEvent)(void *event);
 static void (*ff6_inputMotion)(void *app, void *event);
 static void (*ff6_inputGamePadSetActive)(int active);
 
+/* Read-only state probes: all of these are tiny exported accessors, so we can
+ * poll the engine's own idea of what it is doing without patching anything. */
+static int (*ff6_IsFadeSmartPhone)(void);
+static int (*ff6_getFieldMapNo)(void);
+static int (*ff6_MotionPointFlag)(int);
+
+/* The AGB side keeps its whole state machine in named globals, and AgbIo is the
+ * emulated GBA I/O block -- its first halfword is DISPCNT, whose bit 7 is
+ * forced blank. That single bit is the difference between "drawing nothing"
+ * and "the hardware is told to show black". */
+static uint8_t *ff6_system_mode;
+static uint8_t *ff6_maincnt;
+static uint8_t *ff6_loadhaltflag;
+static uint8_t *ff6_ishaltdata;
+static uint8_t *ff6_loaded_flag;
+static uint8_t *ff6_opening_loop;
+static uint8_t *ff6_Bg0Disp;
+static uint16_t *ff6_AgbIo;
+
 static void resolve_symbols(void) {
   g_app = (uint8_t *)so_symbol(&ff6_mod, "g_app");
 
@@ -1639,13 +1795,44 @@ static void resolve_symbols(void) {
   ff6_inputGamePadSetActive =
       (void (*)(int))so_symbol(&ff6_mod, "inputGamePadSetActive");
 
+  ff6_IsFadeSmartPhone =
+      (int (*)(void))so_symbol(&ff6_mod, "IsFadeSmartPhone");
+  ff6_getFieldMapNo = (int (*)(void))so_symbol(&ff6_mod, "getFieldMapNo");
+  ff6_MotionPointFlag = (int (*)(int))so_symbol(&ff6_mod, "MotionPointFlag");
+
+  ff6_system_mode = (uint8_t *)so_symbol(&ff6_mod, "system_mode");
+  ff6_maincnt = (uint8_t *)so_symbol(&ff6_mod, "maincnt");
+  ff6_loadhaltflag = (uint8_t *)so_symbol(&ff6_mod, "loadhaltflag");
+  ff6_ishaltdata = (uint8_t *)so_symbol(&ff6_mod, "ishaltdata");
+  ff6_loaded_flag = (uint8_t *)so_symbol(&ff6_mod, "__loaded_flag");
+  ff6_opening_loop = (uint8_t *)so_symbol(&ff6_mod, "opening_loop");
+  ff6_Bg0Disp = (uint8_t *)so_symbol(&ff6_mod, "Bg0Disp");
+  ff6_AgbIo = (uint16_t *)so_symbol(&ff6_mod, "AgbIo");
+
   if (!g_app || !ff6_initMainFrame || !ff6_initGame ||
       !ff6_File_SetAAssetManager || !ff6_InputDriverAndroid_onInputEvent ||
       !ff6_inputMotion)
     fatal_error("Error could not resolve libFF6.so entry points.");
 }
 
+/* AgbMain gates the boot on ReadSaveDataResult():
+ *
+ *   if (ReadSaveDataResult() <= 1) goto SquEni;     // normal boot
+ *   InitSaveDataDamage();
+ *   ... 3/4/5 pick a message, anything else picks none ...
+ *   do { vsyncProc(); } while (!UpdateSaveDataDamage());
+ *
+ * With no save file the read falls back to parsing a zeroed buffer, which
+ * yields 2 -- inside the wait loop but with no message set, so the game sits
+ * on a black screen waiting for a tap on a dialog that was never drawn. There
+ * is genuinely no save data here, so answer "read fine" and let it boot; the
+ * game writes a real save the first time the player saves. */
+static int ReadSaveDataResultHook(void) { return 1; }
+
 static void patch_game(void) {
+  hook_addr(so_symbol(&ff6_mod, "ReadSaveDataResult"),
+            (uintptr_t)&ReadSaveDataResultHook);
+
   if (options.aspect) {
     /* DeviceIsGen5() together with !SysConfigIsWide() makes the engine render
      * at the full screen size instead of the pillarboxed 3:2 box that matches
@@ -1822,7 +2009,11 @@ static int main_thread(SceSize args, void *argp) {
   trace("[ff6] File_SetAAssetManager...\n");
   ff6_File_SetAAssetManager(&g_activity);
 
+  /* android_main() wires these two at each other; inputMotion() reaches the
+   * engine through app->userData, so leaving it NULL silently swallows every
+   * touch event. */
   *(void **)(g_app + ENGINE_APP) = &g_android_app;
+  g_android_app.userData = g_app;
   /* initDisplay() overwrites these from eglQuerySurface, but anything that
    * peeks at the screen size before then should still see the truth. */
   *engine_field(ENGINE_SCREEN_W) = SCREEN_W;
@@ -1841,10 +2032,24 @@ static int main_thread(SceSize args, void *argp) {
 
   /* Same job the glue's main thread had: feed input, nothing else. */
   for (int tick = 0;; tick++) {
-    pump_buttons();
     pump_touch();
-    if (tick % 250 == 0)
-      trace("[ff6] input loop alive, tick %d\n", tick);
+    pump_buttons();
+    if (tick % 250 == 0) {
+      unsigned dispcnt = ff6_AgbIo ? ff6_AgbIo[0] : 0;
+      trace("[state] mode=%d maincnt=%d touchflag=0x%x loadhalt=%d ishalt=%d "
+            "loaded=%d openloop=%d bg0=%d fade=%d map=%d DISPCNT=0x%04x%s\n",
+            ff6_system_mode ? *ff6_system_mode : -1,
+            ff6_maincnt ? *ff6_maincnt : -1,
+            ff6_MotionPointFlag ? ff6_MotionPointFlag(0) : -1,
+            ff6_loadhaltflag ? *ff6_loadhaltflag : -1,
+            ff6_ishaltdata ? *ff6_ishaltdata : -1,
+            ff6_loaded_flag ? *ff6_loaded_flag : -1,
+            ff6_opening_loop ? *ff6_opening_loop : -1,
+            ff6_Bg0Disp ? *ff6_Bg0Disp : -1,
+            ff6_IsFadeSmartPhone ? ff6_IsFadeSmartPhone() : -1,
+            ff6_getFieldMapNo ? ff6_getFieldMapNo() : -1, dispcnt,
+            (dispcnt & 0x80) ? " FORCED-BLANK" : "");
+    }
     sceKernelDelayThread(4000);
   }
 

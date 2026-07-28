@@ -48,12 +48,34 @@ void trace(const char *fmt, ...) {
 
   sceClibPrintf("%s", tagged);
 
-  SceUID fd = sceIoOpen(DATA_PATH "/boot.log",
-                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
-  if (fd < 0)
+  /* Collapse runs of the same message: the game emits one libpng warning per
+     decoded image and they would otherwise bury everything else. */
+  static char last[288];
+  static int repeats;
+
+  if (strcmp(tagged, last) == 0) {
+    repeats++;
     return;
+  }
+
+  static SceUID fd = -1;
+  if (fd < 0) {
+    fd = sceIoOpen(DATA_PATH "/boot.log",
+                   SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (fd < 0)
+      return;
+  }
+
+  if (repeats) {
+    char summary[64];
+    int slen = snprintf(summary, sizeof(summary), "  ... x%d more\n", repeats);
+    sceIoWrite(fd, summary, slen);
+    repeats = 0;
+  }
+
+  strncpy(last, tagged, sizeof(last) - 1);
+  last[sizeof(last) - 1] = '\0';
   sceIoWrite(fd, tagged, tlen);
-  sceIoClose(fd);
 }
 
 /* ==========================================================================
