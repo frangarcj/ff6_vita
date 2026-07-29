@@ -2453,24 +2453,10 @@ unsigned gl_frame_counter(void) { return gl_stats.frames; }
 
 extern "C" uint32_t vgl_debug_scene_splits;
 
-/* CONFIRMATION HACK: the AGB compositor batch -- the actual game screen, a
- * GL_FIXED tile soup of hundreds of vertices -- reaches glDrawArrays with the
- * current colour still set to the text renderer's leftover (1,1,1,0). With
- * MODULATE that multiplies the whole game area to nothing. Force the colour
- * opaque for just that draw to prove the theory. */
-static int force_agb_alpha = 1;
-
 static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
   uint32_t splits_before = vgl_debug_scene_splits;
   gl_stats.draws++;
   gl_stats.draws_this_frame++;
-
-  int forced = 0;
-  if (force_agb_alpha && gl_vtx.type == 0x140C /* GL_FIXED */ && count >= 100 &&
-      gl_cur_colour[3] < 0.01f) {
-    glColor4f(gl_cur_colour[0], gl_cur_colour[1], gl_cur_colour[2], 1.0f);
-    forced = 1;
-  }
   /* Flag frames whose scene phase draws something that cannot be invisible:
      bright texture, opaque per-vertex colours, GL_FLOAT scene path. */
   if (gl_vtx.type == GL_FLOAT && gl_bound_texture < TEX_TRACK &&
@@ -2609,10 +2595,6 @@ static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
 
   apply_fixed_arrays(first, count);
   glDrawArrays(mode, first, count);
-
-  if (forced)
-    glColor4f(gl_cur_colour[0], gl_cur_colour[1], gl_cur_colour[2],
-              gl_cur_colour[3]);
 
   /* scene_reset() runs at the top of vitaGL's glDrawArrays, so a delta here
      names the exact draw whose submission split the scene. */
