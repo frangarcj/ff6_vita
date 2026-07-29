@@ -2059,12 +2059,36 @@ static void glVertexPointerHook(GLint size, GLenum type, GLsizei stride,
   glVertexPointer(size, type, stride, ptr);
 }
 
-static struct {
+/* ==========================================================================
+ * GL_FIXED colour arrays
+ *
+ * GLES 1.1 allows GL_FIXED (16.16 fixed point) for colour arrays and the
+ * Android build uses it for battle sprites -- drawImagePriBlend issues
+ * glColorPointer(4, GL_FIXED, 0, ...). vitaGL's glColorPointer has no case
+ * for it: it raises GL_INVALID_ENUM and returns *without* setting the
+ * attribute format, so the colour attribute keeps whatever layout the
+ * previous draw left behind and the sprites come out with garbage vertex
+ * colours -- which is why neither the party nor the enemies were visible.
+ *
+ * The Vita has no fixed-point vertex format, so vitaGL handles GL_FIXED
+ * elsewhere (position, normals, texcoords) by declaring the attribute float
+ * and unpacking it in the generated vertex shader. There is no such path for
+ * colours, so convert them here instead: hold the pointer back, and at draw
+ * time expand the range being drawn into floats and hand vitaGL a plain
+ * GL_FLOAT array.
+ * ======================================================================== */
+
+typedef struct {
   GLint size;
   GLenum type;
   GLsizei stride;
   const void *ptr;
-} gl_col;
+  GLfloat *buf;
+  size_t verts;
+} fixed_array;
+
+static fixed_array gl_col;
+static fixed_array gl_uv;
 
 static void glColorPointerHook(GLint size, GLenum type, GLsizei stride,
                                const void *ptr) {
@@ -2072,15 +2096,94 @@ static void glColorPointerHook(GLint size, GLenum type, GLsizei stride,
   gl_col.type = type;
   gl_col.stride = stride;
   gl_col.ptr = ptr;
+
+  /* Hand GL_FIXED to vitaGL and it errors out and leaves the attribute
+   * misconfigured, so defer it to draw time instead. */
+  if (type == GL_FIXED)
+    return;
+
   glColorPointer(size, type, stride, ptr);
+}
+
+/* Expand one fixed-point array covering [0, first + count) into floats. The
+ * whole prefix is converted because glDrawArrays indexes the array from its
+ * base, not from `first`.
+ *
+ * `enabled_cap` matters: an array whose client state is off must be left
+ * alone. drawImagePriBlend points the colour array at its own stack frame and
+ * leaves GL_COLOR_ARRAY enabled on the way out, so by the time a big batch is
+ * drawn -- the AGB compositor submits over a thousand vertices -- that pointer
+ * is a dead frame. Converting it regardless walked off the end of the stack
+ * and took the process down with a data abort. */
+static GLfloat *expand_fixed_array(fixed_array *a, GLenum enabled_cap,
+                                   GLint first, GLsizei count, int min_comps,
+                                   int max_comps) {
+  if (a->type != GL_FIXED || !a->ptr || count <= 0)
+    return NULL;
+  if (!glIsEnabled(enabled_cap))
+    return NULL;
+  if (a->size < min_comps || a->size > max_comps)
+    return NULL;
+
+  size_t needed = (size_t)first + (size_t)count;
+  int comps = a->size;
+
+  if (needed > a->verts) {
+    GLfloat *grown =
+        (GLfloat *)realloc(a->buf, needed * (size_t)comps * sizeof(GLfloat));
+    if (!grown)
+      return NULL;
+    a->buf = grown;
+    a->verts = needed;
+  }
+
+  size_t src_stride =
+      a->stride ? (size_t)a->stride : (size_t)comps * sizeof(int32_t);
+  const unsigned char *src = (const unsigned char *)a->ptr;
+
+  for (size_t v = 0; v < needed; v++) {
+    const int32_t *in = (const int32_t *)(src + v * src_stride);
+    GLfloat *out = &a->buf[v * comps];
+    for (int c = 0; c < comps; c++)
+      out[c] = (GLfloat)in[c] / 65536.0f;
+  }
+  return a->buf;
+}
+
+static void apply_fixed_arrays(GLint first, GLsizei count) {
+  /* Colours only. Texture coordinates are also GL_FIXED and converting them
+   * here would sidestep the shader-side unpack that costs a texel of
+   * precision at tile edges -- but that conversion runs over every vertex of
+   * every batch, and the AGB compositor submits over a thousand at a time.
+   * Paying that on a 444 MHz core to remove a one pixel seam is the wrong
+   * trade; the precision belongs in vitaGL's generated shader, where it is
+   * free. See HUNT.md. */
+  if (expand_fixed_array(&gl_col, GL_COLOR_ARRAY, first, count, 3, 4))
+    glColorPointer(gl_col.size, GL_FLOAT, 0, gl_col.buf);
+}
+
+/* Release path: the debug build routes glDrawArrays through its own hook,
+ * which calls apply_fixed_arrays itself. */
+static void glDrawArraysFixed(GLenum mode, GLint first, GLsizei count) {
+  apply_fixed_arrays(first, count);
+  glDrawArrays(mode, first, count);
 }
 
 static void glTexCoordPointerHook(GLint size, GLenum type, GLsizei stride,
                                   const void *ptr) {
+  gl_uv.size = size;
+  gl_uv.type = type;
+  gl_uv.stride = stride;
+  gl_uv.ptr = ptr;
+
   gl_tex.size = size;
   gl_tex.type = type;
   gl_tex.stride = stride;
   gl_tex.ptr = ptr;
+
+  /* Unlike colours, vitaGL does accept GL_FIXED here, so pass it through: if a
+   * draw ends up not going through the conversion the original pointer is
+   * still valid and behaves as before. */
   glTexCoordPointer(size, type, stride, ptr);
 }
 
@@ -2255,6 +2358,7 @@ static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
           (int)(pj[13] * 1000), (int)(pj[14] * 1000));
   }
 
+  apply_fixed_arrays(first, count);
   glDrawArrays(mode, first, count);
 
   if (forced)
