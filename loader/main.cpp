@@ -105,6 +105,7 @@ static void set_default_options(void) {
   options.lang = 0;
   options.msaa = 2;
   options.sound = 1;
+  options.font_scale = 100;
 }
 
 static void loadOptions(void) {
@@ -130,6 +131,8 @@ static void loadOptions(void) {
       options.msaa = value;
     else if (strcmp("sound", key) == 0)
       options.sound = value;
+    else if (strcmp("fontscale", key) == 0)
+      options.font_scale = value > 0 ? value : 100;
   }
 
   fclose(f);

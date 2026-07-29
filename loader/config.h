@@ -22,6 +22,11 @@ typedef struct {
   int lang;     /* 0 = system, otherwise getSystemLanguage() value + 1 */
   int msaa;     /* 0 = off, 1 = 2x, 2 = 4x */
   int sound;    /* 0 disables the OpenSL ES engine entirely */
+  int font_scale;    /* glyph size as a percentage. 100 keeps (ascent -
+                      * descent) at the size the engine asks for, which is
+                      * what matches a capture of the real game; 136 is what
+                      * mapping the EM square gives, i.e. Android's own
+                      * metrics, and runs into the line below. */
 } config_opts;
 
 extern config_opts options;

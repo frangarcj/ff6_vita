@@ -234,7 +234,15 @@ static void update_metrics(void) {
   }
 
   int ascent, descent, line_gap;
+  /* Keep (ascent - descent) equal to the requested size. Mapping the EM square
+   * to it instead -- which is what Paint.setTextSize() does on Android -- makes
+   * Noto Sans about 1.36x taller, and the engine spaces its lines on its own:
+   * measured against a capture of the real game, glyphs then covered 4.6% of
+   * the screen height against 3.2%, so lines ran into each other. At this
+   * scale they come out at 3.4%, which matches. */
   paint_scale = stbtt_ScaleForPixelHeight(font_info, (float)paint_size);
+  if (options.font_scale > 0 && options.font_scale != 100)
+    paint_scale = paint_scale * (float)options.font_scale / 100.0f;
   stbtt_GetFontVMetrics(font_info, &ascent, &descent, &line_gap);
 
   paint_ascent = (int)(fabsf(ascent * paint_scale) + 0.5f);
@@ -247,8 +255,13 @@ void setTextColor(int argb) {
     logged++;
     trace("[txt] setTextColor(0x%08x)\n", argb);
   }
+  if (argb == paint_color)
+    return;
+
   paint_color = argb;
-  /* Colour never reaches our bitmap: the .so ORs its own RGB over our alpha. */
+  /* rasterize_text() bakes this into the bitmap, so a colour change has to
+   * invalidate the cached rasterization the same way a text change does. */
+  text_dirty = 1;
 }
 
 void setTextFontSize(int size) {
@@ -414,11 +427,31 @@ static void rasterize_text(void) {
     }
   }
 
+  /* Colour has to come from us. The engine hands the bitmap straight to
+   * TextGlyphTexture::drawGlyph without touching it, so coverage alone leaves
+   * the atlas texels at RGB 0 -- and the glyph draws MODULATE against the
+   * current colour, which multiplies black by anything and stays black. That
+   * is why every atlas-drawn string (the copyright line, menus) was invisible
+   * while the AGB tile text was fine.
+   *
+   * The buffer is Android ARGB_8888, whose bytes are R,G,B,A in memory, so the
+   * int is (A<<24)|(B<<16)|(G<<8)|R -- red and blue swapped relative to the
+   * 0xAARRGGBB colour the engine passes to setTextColor. */
+  unsigned int r = ((unsigned int)paint_color >> 16) & 0xFF;
+  unsigned int g = ((unsigned int)paint_color >> 8) & 0xFF;
+  unsigned int b = (unsigned int)paint_color & 0xFF;
+  unsigned int alpha = ((unsigned int)paint_color >> 24) & 0xFF;
+  unsigned int rgb = (b << 16) | (g << 8) | r;
+
   for (int y = 0; y < height; y++) {
     const unsigned char *src = coverage + y * TEXT_IMG_W;
     int *dst = &text_image.elements[y * TEXT_IMG_W];
-    for (int x = 0; x < width; x++)
-      dst[x] = (int)((unsigned int)src[x] << 24);
+    for (int x = 0; x < width; x++) {
+      unsigned int a = src[x];
+      if (alpha != 0xFF)
+        a = (a * alpha + 127) / 255;
+      dst[x] = (int)((a << 24) | rgb);
+    }
   }
 
   free(coverage);
