@@ -2244,6 +2244,8 @@ typedef struct {
   const void *ptr;
   GLfloat *buf;
   size_t verts;
+  int fresh;        /* ptr registered since the last conversion */
+  size_t converted; /* vertices of buf that hold real converted data */
 } fixed_array;
 
 static fixed_array gl_col;
@@ -2262,8 +2264,10 @@ static void glColorPointerHook(GLint size, GLenum type, GLsizei stride,
    * shader (same trick it already used for positions and texcoords), which
    * costs nothing per vertex; fixedcolor=1 in options.cfg uses that path. */
   if (type == GL_FIXED) {
-    if (!options.fixed_color_native)
+    if (!options.fixed_color_native) {
+      gl_col.fresh = 1;
       return;
+    }
     gl_col.type = 0; /* nothing pending for draw-time conversion */
   }
 
@@ -2302,6 +2306,28 @@ static GLfloat *expand_fixed_array(fixed_array *a, GLenum enabled_cap,
     a->verts = needed;
   }
 
+  /* The source pointer is only known to be alive for draws issued while it is
+   * fresh -- drawImagePriBlend points it at its own stack frame, draws four
+   * vertices and returns with GL_COLOR_ARRAY still enabled. The next big
+   * batch (menus, battle text, the AGB compositor) then arrives with the
+   * array enabled, the type still GL_FIXED and the pointer dead. Reading it
+   * anyway is what the emulator quietly survived -- its stale stack keeps
+   * plausible values -- while on hardware anything can have reused that page:
+   * garbage per-vertex colours all over the character menu and battle, and
+   * once, a data abort. Convert from the pointer once per registration; after
+   * that, reuse what was converted and pad any longer draw with opaque white,
+   * which under MODULATE shows the texture as authored. */
+  if (!a->fresh) {
+    if (needed > a->converted) {
+      for (size_t v = a->converted; v < needed; v++)
+        for (int c = 0; c < comps; c++)
+          a->buf[v * comps + c] = 1.0f;
+      a->converted = needed;
+    }
+    return a->buf;
+  }
+  a->fresh = 0;
+
   size_t src_stride =
       a->stride ? (size_t)a->stride : (size_t)comps * sizeof(int32_t);
   const unsigned char *src = (const unsigned char *)a->ptr;
@@ -2312,6 +2338,7 @@ static GLfloat *expand_fixed_array(fixed_array *a, GLenum enabled_cap,
     for (int c = 0; c < comps; c++)
       out[c] = (GLfloat)in[c] / 65536.0f;
   }
+  a->converted = needed;
   return a->buf;
 }
 
