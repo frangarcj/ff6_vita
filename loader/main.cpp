@@ -243,6 +243,70 @@ static int nanosleep_fake(const struct timespec *req, struct timespec *rem) {
   return 0;
 }
 
+/* Bionic and newlib disagree on the numeric values of the open() flags, and
+ * the .so was compiled against Bionic's. Passing them through unchanged means
+ * O_CREAT never arrives: saving called
+ * open("ux0:ff6/RockDat0.sav", 0x42, 0600) -- O_RDWR|O_CREAT to Bionic -- and
+ * newlib read 0x42 as O_RDWR with a flag it does not use, tried to open a file
+ * that did not exist yet, and returned -1. The engine then gave up before its
+ * fopen("wb"), which is why a save reported failure with no write-mode open
+ * anywhere in the trace.
+ *
+ * Only the bits that differ need mapping; the low two bits (RDONLY/WRONLY/
+ * RDWR) are the same on both. */
+/* The .so builds its paths from a hardcoded "/sdcard/", the Android external
+ * storage root, which means nothing here. Rather than rewrite string literals
+ * inside the module, translate at the only door they can leave through: our
+ * own file shims. Everything then lands under the game's own data directory. */
+static const char *translate_path(const char *path, char *buf, size_t buflen) {
+  static const char sdcard[] = "/sdcard/";
+
+  if (!path || strncmp(path, sdcard, sizeof(sdcard) - 1) != 0)
+    return path;
+
+  snprintf(buf, buflen, DATA_PATH "/%s", path + sizeof(sdcard) - 1);
+  return buf;
+}
+
+#define BIONIC_O_CREAT 0x40
+#define BIONIC_O_EXCL 0x80
+#define BIONIC_O_TRUNC 0x200
+#define BIONIC_O_APPEND 0x400
+#define BIONIC_O_NONBLOCK 0x800
+
+static int translate_open_flags(int flags) {
+  int out = flags & O_ACCMODE;
+
+  if (flags & BIONIC_O_CREAT)
+    out |= O_CREAT;
+  if (flags & BIONIC_O_EXCL)
+    out |= O_EXCL;
+  if (flags & BIONIC_O_TRUNC)
+    out |= O_TRUNC;
+  if (flags & BIONIC_O_APPEND)
+    out |= O_APPEND;
+  if (flags & BIONIC_O_NONBLOCK)
+    out |= O_NONBLOCK;
+
+  return out;
+}
+
+static int open_fake(const char *path, int flags, ...) {
+  va_list ap;
+  va_start(ap, flags);
+  int mode = va_arg(ap, int);
+  va_end(ap);
+
+  char buf[256];
+  return open(translate_path(path, buf, sizeof(buf)),
+              translate_open_flags(flags), mode);
+}
+
+static FILE *fopen_fake(const char *path, const char *mode) {
+  char buf[256];
+  return fopen(translate_path(path, buf, sizeof(buf)), mode);
+}
+
 static void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd,
                        off_t offset) {
   return malloc(length);
@@ -1482,6 +1546,8 @@ static volatile unsigned last_shim_arg;
 
 static FILE *fopen_mark(const char *path, const char *mode) {
   MARK("fopen");
+  char buf[256];
+  path = translate_path(path, buf, sizeof(buf));
   return fopen(path, mode);
 }
 
@@ -1875,7 +1941,7 @@ static so_default_dynlib default_dynlib[] = {
     {"modf", WRAP((double (*)(double, double *))modf)},
     {"munmap", (uintptr_t)&munmap_fake},
     {"nanosleep", (uintptr_t)&nanosleep_fake},
-    {"open", (uintptr_t)&open},
+    {"open", (uintptr_t)&open_fake},
     {"pipe", (uintptr_t)&ret0},
     {"pow", WRAP((double (*)(double, double))pow)},
     {"powf", WRAP(powf)},
