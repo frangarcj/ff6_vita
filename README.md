@@ -99,17 +99,36 @@ ux0:data/ff6/options.cfg   (optional)
 
 An optional `key=value` file in `ux0:data/ff6`:
 
-| key            | values                                                    |
-| -------------- | --------------------------------------------------------- |
-| `bilinear`     | `0` nearest (default), `1` linear filtering                |
-| `language`     | `0` follow the system, otherwise `getSystemLanguage()` + 1 |
-| `antialiasing` | `0` off, `1` MSAA 2x, `2` MSAA 4x (default)                |
-| `aspect`       | `0` pillarboxed 3:2 (default), `1` stretch to fullscreen   |
+| key            | values                                                       |
+| -------------- | ------------------------------------------------------------ |
+| `bilinear`     | `0` nearest (default), `1` linear, `2` crisp + filtered upscale |
+| `integerscale` | `0` fill the 3:2 box (default), `1` snap to a whole multiple  |
+| `language`     | `0` follow the system, otherwise `getSystemLanguage()` + 1    |
+| `antialiasing` | `0` off, `1` MSAA 2x, `2` MSAA 4x (default)                   |
+| `aspect`       | `0` pillarboxed 3:2 (default), `1` stretch to fullscreen      |
 
 `aspect=0` reproduces the engine's own non-tablet path, which picks the largest
 3:2 box that fits the screen -- 816x544 on the Vita, matching the GBA's 240x160
 aspect. `aspect=1` patches `DeviceIsGen5`/`SysConfigIsWide` so the engine
 renders at the full 960x544 instead.
+
+#### Filtering
+
+The engine composes a 480x320 world and the port scales it to the 816x544 box,
+a 1.7x factor. The Android build asks for `GL_LINEAR` on every texture, which
+blurs the art before it is ever scaled; sampling everything `GL_NEAREST`
+instead keeps it sharp but makes a source pixel cover one or two screen pixels
+depending on where it lands, which shimmers as the camera moves.
+
+`bilinear=2` avoids both: the world is drawn into an offscreen buffer at twice
+its own size with `GL_NEAREST`, then scaled to the box once with `GL_LINEAR`.
+Sampling stays exact and only the final step is filtered. The side panels are
+drawn separately in screen space, so they stay pixel-exact either way.
+
+`integerscale=1` is the other way to get an even pixel grid: it shrinks the
+game area to the largest whole multiple of 480x320 that fits. On a 544-tall
+panel that is only 1x, i.e. a 480x320 image using half the screen, so
+`bilinear=2` is usually the better trade.
 
 ## Build Instructions (For Developers)
 
