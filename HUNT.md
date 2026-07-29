@@ -74,9 +74,33 @@ A 444 MHz todas las escenas medidas van a 60 fps salvo hipos de carga.
   (el id puede reutilizarse y el skip se comería un bind real) y
   `glActiveTextureHook` lo invalida al cambiar de unidad.
 
+### Regresión en consola: menús de personajes y combate con texturas/texto rotos
+Reportada por el usuario tras confirmar que Narshe ya va fluido con
+`inplacetex=1`. Revisión completa de los parches del loader hecha (sesión 4);
+**sospechoso número uno, ya arreglado**: `expand_fixed_array` reconvertía el
+array de colores `GL_FIXED` en CADA draw mientras `GL_COLOR_ARRAY` siguiera
+habilitado — y `drawImagePriBlend` sale dejándolo habilitado apuntando a su
+propia pila muerta. En Vita3K esa pila conserva valores plausibles (por eso
+allí se veía bien); en consola cualquier interrupción la machaca → colores
+por vértice basura en menús y combate, que son exactamente los caminos que
+pasan por `drawImagePriBlend`. Ahora se convierte UNA vez por registro del
+puntero; los draws posteriores reutilizan lo convertido y el exceso se
+rellena con blanco opaco (identidad bajo MODULATE). El campo/mapa no usa
+ese camino y no se ve afectado. Commit "Never reconvert GL_FIXED colours
+from a stale pointer". La historia entera está ahora troceada en commits por
+feature para poder bisectar si no fuera esto (rama `main` reescrita; la
+antigua sobrevive en `backup-pre-restructure`).
+De la misma revisión: fuera el `force_agb_alpha` (probe de sesión 2 que
+seguía armado en builds de debug), y el skip-cache de binds quedó blindado
+contra borrado de textura atada y cambio de unidad (ids reutilizados podían
+comerse un bind real).
+
 ### Pendiente de la sesión 4
 1. **Probar en consola** (a mano, sin red): fps en Narshe con `inplacetex=1`
    vs `inplacetex=0`, y mirar artefactos en los bordes del scroll.
+   **Hecho por red con el usuario delante: Narshe fluido confirmado.**
+   Pendiente el A/B de artefactos y la validación de menús/combate tras el
+   arreglo del puntero muerto.
 2. Si queda corto: el resto del coste por sub-subida es el propio write de
    128 KB a RAM sin caché; opciones: pool de staging + `sceGxmTransferCopy`,
    o `vglUseCachedMem` AHORA SÍ (con la orfandad fuera, la copia restante es
