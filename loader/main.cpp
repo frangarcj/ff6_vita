@@ -2581,10 +2581,50 @@ static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
                   pixels);
 }
 
+/* The engine rebinds a texture before every single draw -- measured at 117
+ * binds for 116 draws in a frame -- and a good share of those name the texture
+ * that is already bound. Under vitaGL a bind is not free: it dirties the
+ * fixed-function state and can send the next draw through reload_ffp_shaders.
+ * Swallowing the repeats is safe and costs one comparison. */
+static GLuint bound_texture_2d = 0;
+
+unsigned gl_binds_skipped;
+unsigned gl_binds_real;
+
+/* For binds the loader itself issues: keeps the cache honest. */
+static void bind_texture_2d(GLuint texture) {
+  bound_texture_2d = texture;
+  glBindTexture(GL_TEXTURE_2D, texture);
+}
+
 static void glBindTextureHook(GLenum target, GLuint texture) {
+  /* Instrumentation's view of the game's intended binding. Must update even
+   * when the bind is skipped below. */
+  if (target == GL_TEXTURE_2D)
+    gl_bound_texture = texture;
   gl_stats.binds++;
-  gl_bound_texture = texture;
+  if (target == GL_TEXTURE_2D) {
+    if (texture == bound_texture_2d) {
+      gl_binds_skipped++;
+      return;
+    }
+    bound_texture_2d = texture;
+  }
+
+  gl_binds_real++;
   glBindTexture(target, texture);
+}
+
+/* Two ways the skip cache above can go stale: deleting the bound texture
+ * unbinds it inside GL (and the id can be handed out again), and a bind on
+ * another texture unit changes which binding glBindTexture(GL_TEXTURE_2D)
+ * refers to. Either would make the skip eat a REAL bind and send every
+ * following upload to the wrong texture. Invalidate on both. */
+static void glDeleteTexturesHook(GLsizei n, const GLuint *textures) {
+  for (GLsizei i = 0; i < n; i++)
+    if (textures[i] == bound_texture_2d)
+      bound_texture_2d = 0xFFFFFFFFu;
+  glDeleteTextures(n, textures);
 }
 
 
@@ -2597,6 +2637,9 @@ static void glActiveTextureHook(GLenum unit) {
       logged++;
     }
     gl_active_unit = unit;
+    /* glBindTexture(GL_TEXTURE_2D,...) now refers to another unit's binding:
+     * the skip cache no longer knows what is bound. */
+    bound_texture_2d = 0xFFFFFFFFu;
   }
   glActiveTexture(unit);
 }
@@ -2915,7 +2958,7 @@ static so_default_dynlib default_dynlib[] = {
     {"glColorPointer", (uintptr_t)&glColorPointerHook},
     {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook},
     {"glCullFace", (uintptr_t)&glCullFace},
-    {"glDeleteTextures", (uintptr_t)&glDeleteTextures},
+    {"glDeleteTextures", (uintptr_t)&glDeleteTexturesHook},
     {"glDepthFunc", (uintptr_t)&glDepthFunc},
     {"glDepthMask", (uintptr_t)&glDepthMask},
     {"glDisable", (uintptr_t)&glDisable},
@@ -3255,7 +3298,7 @@ static void drawGlyphHook(void *self, int idx, int *pixels) {
   int xoff = (idx % per_row) * cell;
   int yoff = (idx / per_row) * cell;
 
-  glBindTexture(GL_TEXTURE_2D, handle);
+  bind_texture_2d(handle);
   glTexSubImage2D(GL_TEXTURE_2D, 0, xoff, yoff, w, h, GL_RGBA,
                   GL_UNSIGNED_BYTE, buf);
 
