@@ -23,6 +23,7 @@
 
 #include <stdarg.h>
 
+#ifdef FF6_DEBUG
 /* Boot tracing: the emulator buffers tty output, so a host-side crash loses it.
  * Writing through sceIo and closing every time survives anything. */
 void trace(const char *fmt, ...) {
@@ -77,6 +78,7 @@ void trace(const char *fmt, ...) {
   last[sizeof(last) - 1] = '\0';
   sceIoWrite(fd, tagged, tlen);
 }
+#endif /* FF6_DEBUG */
 
 /* ==========================================================================
  * Font handling
@@ -472,6 +474,7 @@ jni_intarray *getTextImg(void) {
     text_dirty = 0;
   }
 
+#ifdef FF6_DEBUG
   /* DEBUG: prove whether the glyphs we rasterize actually carry coverage, and
    * for which string, so an empty upload can be blamed on the right side of
    * the JNI boundary. */
@@ -490,10 +493,12 @@ jni_intarray *getTextImg(void) {
             nonzero);
     }
   }
+#endif
 
   return &text_image;
 }
 
+#ifdef FF6_DEBUG
 /* Nonzero count over the glyph-cell region at the exact moment the engine
  * takes the pixel pointer; a zero here with ink at getTextImg time means
  * something cleared the buffer in between. */
@@ -507,6 +512,7 @@ int debugTextRegionNonzero(void) {
         nonzero++;
   return nonzero;
 }
+#endif
 
 int getTextFontSize(int size) {
   /* FF6.java sets the size and hands back the resulting line height. The

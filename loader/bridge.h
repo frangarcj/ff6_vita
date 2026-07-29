@@ -67,7 +67,15 @@ void setLimitInputText(int limit);
 void setClipBoardCopy(const char *text);
 int isInputDialogOpen(void);
 
+/* Boot/GL tracing to ux0:data/ff6/boot.log. Debug builds only: in a release
+ * build every call site compiles away, so the log file is never created and
+ * nothing pays for the formatting. */
+#ifdef FF6_DEBUG
 void trace(const char *fmt, ...);
 int debugTextRegionNonzero(void);
+#else
+static inline void trace(const char *fmt, ...) { (void)fmt; }
+static inline int debugTextRegionNonzero(void) { return 0; }
+#endif
 
 #endif

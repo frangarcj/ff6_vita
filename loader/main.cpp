@@ -80,6 +80,20 @@ extern "C" {
 
 #include "softfp_wrappers.hpp"
 
+/* FF6_DEBUG selects the black-screen-hunt instrumentation: GL call logging,
+ * per-frame dumps, on-screen probes, the hang watchdog and the boot.log
+ * tracer. Release builds keep only the functional shims and fixes.
+ * DBG_ALT picks the instrumented or the plain symbol-table entry. */
+#ifdef FF6_DEBUG
+#define DBG_ALT(dbg, rel) (dbg)
+#else
+#define DBG_ALT(dbg, rel) (rel)
+#endif
+
+/* Defined further down with the offscreen buffer; the swap needs these. */
+static void present_scene_fbo(void);
+static void bind_scene_fbo(void);
+
 int SCREEN_W = DEF_SCREEN_W;
 int SCREEN_H = DEF_SCREEN_H;
 
@@ -99,10 +113,6 @@ void *__wrap_memmove(void *dest, const void *src, size_t n) {
 }
 void *__wrap_memset(void *s, int c, size_t n) { return sceClibMemset(s, c, n); }
 }
-
-/* Defined further down with the offscreen buffer; the swap needs these. */
-static void present_scene_fbo(void);
-static void bind_scene_fbo(void);
 
 static void set_default_options(void) {
   options.bilinear = 0;
@@ -1409,12 +1419,14 @@ static SOFTFP_ABI float AMotionEvent_getY(const void *e, size_t index) {
  * EGL over vitaGL
  * ======================================================================== */
 
+#ifdef FF6_DEBUG
 static void gl_stats_report(void);
 
 /* Set when the current frame contained a scene draw that must be plainly
  * visible: opaque per-vertex colours and a texture known to hold bright
  * content. The swap then freezes so a screenshot can catch that exact frame. */
 static int frame_has_bright_scene_draw;
+#endif
 
 #define FAKE_EGL_DISPLAY ((void *)0xE9100001)
 #define FAKE_EGL_SURFACE ((void *)0xE9100002)
@@ -1489,6 +1501,7 @@ static unsigned fake_eglQuerySurface(void *dpy, void *surface, int attribute,
 }
 
 
+#ifdef FF6_DEBUG
 /* DIAGNOSTIC: two solid quads drawn through exactly the path the scene uses
  * (GL_FLOAT vertex array, same ortho), one under the pillarboxed viewport the
  * scene gets and one under the full-screen viewport the visible side panels
@@ -1627,8 +1640,10 @@ static void probe_pixel(const char *what, int x, int y) {
   trace("[px] %s (%d,%d) = %d,%d,%d,%d\n", what, x, y, px[0], px[1], px[2],
         px[3]);
 }
+#endif /* FF6_DEBUG */
 
 static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
+#ifdef FF6_DEBUG
   gl_stats_report();
 
   /* Read the game's own output before covering it with the probe, then the
@@ -1685,6 +1700,7 @@ static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
     probe_pixel("probe GREEN(full vp)", 700, SCREEN_H / 2);
     probe_pixel("probe TEXTURED", 480, 40);
   }
+#endif /* FF6_DEBUG */
 
   /* The IME dialog has to be composited by the Vita's own display stack, so we
    * ask vitaGL to keep the framebuffer around while it is up. */
@@ -1700,6 +1716,7 @@ static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
    * and the world ends up on the display anyway. */
   bind_scene_fbo();
 
+#ifdef FF6_DEBUG
   /* Freeze exactly once, right after presenting a frame whose scene phase
      drew a bright opaque quad. Whatever is on screen during this pause IS
      that frame -- the screenshot can no longer sample the wrong moment. */
@@ -1714,6 +1731,7 @@ static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
     }
     frame_has_bright_scene_draw = 0;
   }
+#endif
   return 1;
 }
 
@@ -1732,15 +1750,44 @@ static void ANativeWindow_setBuffersGeometry(void *window, int w, int h,
 static GLint filter_override(GLenum pname, GLint param) {
   if (pname != GL_TEXTURE_MIN_FILTER && pname != GL_TEXTURE_MAG_FILTER)
     return param;
+  /* FILTER_UPSCALE samples exactly too -- its single filtered step happens
+   * later, when the offscreen world is put on screen. */
   return options.bilinear == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
 }
 
+#ifdef FF6_DEBUG
+/* Which wrap mode the engine asks for, per texture. GL_REPEAT on an atlas is
+ * a known source of the thin seams along tile edges: at a non-integer scale
+ * the coordinate at a tile border can land a hair outside its cell, and REPEAT
+ * then fetches from the far side of the atlas instead of clamping. */
+static void log_wrap(GLenum pname, GLint param) {
+  if (pname != GL_TEXTURE_WRAP_S && pname != GL_TEXTURE_WRAP_T)
+    return;
+  static int logged;
+  if (logged >= 24)
+    return;
+  logged++;
+  trace("[wrap] %s = %s (0x%x)\n",
+        pname == GL_TEXTURE_WRAP_S ? "WRAP_S" : "WRAP_T",
+        param == GL_REPEAT ? "GL_REPEAT"
+                           : (param == GL_CLAMP_TO_EDGE ? "GL_CLAMP_TO_EDGE"
+                                                        : "?"),
+        (unsigned)param);
+}
+#endif
+
 static void glTexParameteriHook(GLenum target, GLenum pname, GLint param) {
+#ifdef FF6_DEBUG
+  log_wrap(pname, param);
+#endif
   glTexParameteri(target, pname, filter_override(pname, param));
 }
 
 static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
                                            GLfloat param) {
+#ifdef FF6_DEBUG
+  log_wrap(pname, (GLint)param);
+#endif
   glTexParameterf(target, pname,
                   (GLfloat)filter_override(pname, (GLint)param));
 }
@@ -1749,6 +1796,7 @@ static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
  * ambient, which we can safely ignore. */
 static SOFTFP_ABI void glLightModelf(GLenum pname, GLfloat param) {}
 
+#ifdef FF6_DEBUG
 /* Log the texture-env transitions: REPLACE vs MODULATE decides whether the
  * current colour (often the text renderer's leftover alpha-0 white) multiplies
  * a draw to nothing. */
@@ -1837,11 +1885,46 @@ static volatile unsigned last_shim_arg;
     mark_shim((x), (unsigned)(a));                                             \
   } while (0)
 
+static int open_mark(const char *path, int flags, ...) {
+  va_list ap;
+  va_start(ap, flags);
+  int mode = va_arg(ap, int);
+  va_end(ap);
+
+  char buf[256];
+  path = translate_path(path, buf, sizeof(buf));
+  int fd = open(path, translate_open_flags(flags), mode);
+  if (path && (strstr(path, "RockDat") || strstr(path, ".sav"))) {
+    static int logged;
+    if (logged < 20) {
+      logged++;
+      trace("[io] open(\"%s\", 0x%x, 0%o) -> %d\n", path, flags, mode, fd);
+    }
+  }
+  return fd;
+}
+
 static FILE *fopen_mark(const char *path, const char *mode) {
   MARK("fopen");
   char buf[256];
   path = translate_path(path, buf, sizeof(buf));
-  return fopen(path, mode);
+  FILE *f = fopen(path, mode);
+  /* Writes are rare and they are the ones that matter: a save that reports
+   * success while no file appears fails somewhere on this line. */
+  int is_write = mode && (mode[0] == 'w' || mode[0] == 'a');
+  /* Also every touch of a save file whatever the mode: the write path probes
+   * with fopen("r") first, so logging writes alone hides which directory it
+   * actually went looking in. */
+  int is_save = path && (strstr(path, "RockDat") || strstr(path, ".sav"));
+  if (is_write || is_save) {
+    static int logged;
+    if (logged < 30) {
+      logged++;
+      trace("[io] fopen(\"%s\", \"%s\") -> %s\n", path ? path : "(null)", mode,
+            f ? "ok" : "FALLO");
+    }
+  }
+  return f;
 }
 
 static size_t fread_mark(void *p, size_t sz, size_t n, FILE *f) {
@@ -1906,6 +1989,13 @@ static int cond_wait_mark(pthread_cond_t **cnd, pthread_mutex_t **mtx) {
     return -1;
   return pthread_cond_wait(*cnd, *mtx);
 }
+#else  /* !FF6_DEBUG */
+/* No watchdog in release: mutex ownership is not tracked. */
+static void set_owner(void *slot, SceUID owner) {
+  (void)slot;
+  (void)owner;
+}
+#endif /* FF6_DEBUG */
 
 /* Experiment hook: with options.sound == 0 we refuse to create the OpenSL ES
  * engine, which is the quickest way to tell whether the game's clock is gated
@@ -1930,12 +2020,14 @@ static SLresult slCreateEngineHook(SLObjectItf *engine, SLuint32 numOptions,
  * patching a single byte of the module.
  * ======================================================================== */
 
+#ifdef FF6_DEBUG
 static unsigned gl_dump_frame = 0;
 static GLuint gl_bound_texture;
 /* Which texture unit the game's binds and draws land on. A bind issued while
  * the active unit is not 0 feeds a unit the fixed-function setup never
  * samples, which renders exactly as "draws everything, shows nothing". */
 static GLenum gl_active_unit = 0x84C0 /* GL_TEXTURE0 */;
+#endif
 
 /* cTsModel::drawModel saves the current matrix mode with
  * glGetIntegerv(GL_MATRIX_MODE), switches to GL_TEXTURE, translates the
@@ -1946,6 +2038,7 @@ static GLenum gl_active_unit = 0x84C0 /* GL_TEXTURE0 */;
  * mode ourselves so the query is always right. */
 static GLint gl_matrix_mode = GL_MODELVIEW;
 
+#ifdef FF6_DEBUG
 static const char *client_state_name(GLenum a) {
   switch (a) {
   case GL_VERTEX_ARRAY: return "VERTEX";
@@ -1973,36 +2066,59 @@ static void glDisableClientStateHook(GLenum array) {
   }
   glDisableClientState(array);
 }
+#endif /* FF6_DEBUG */
 
 static void glMatrixModeHook(GLenum mode) {
   gl_matrix_mode = (GLint)mode;
+#ifdef FF6_DEBUG
   if (mode == GL_TEXTURE)
     trace("[gl] glMatrixMode(GL_TEXTURE) -- cTsModel::drawModel path is live\n");
+#endif
   glMatrixMode(mode);
 }
 
 static void glGetIntegervHook(GLenum pname, GLint *params) {
   if (pname == GL_MATRIX_MODE && params) {
-    GLint from_vitagl = -12345;
-    glGetIntegerv(pname, &from_vitagl);
     *params = gl_matrix_mode;
-    trace("[gl] GL_MATRIX_MODE queried: vitaGL said 0x%x, we answer 0x%x\n",
-          from_vitagl, gl_matrix_mode);
     return;
   }
   glGetIntegerv(pname, params);
 }
 
+#ifdef FF6_DEBUG
 /* Per-texture provenance: uploaded with pixels, or created empty and filled by
  * glTexSubImage2D afterwards? The scene atlases take the second route and the
  * visible side panels take the first -- the one difference that lines up with
  * what does and does not appear. */
-#define TEX_TRACK 256
+#define TEX_TRACK 1024
 static struct {
   unsigned char created_with_data;
   unsigned char bright; /* mostly-nonzero content with max=255 */
   unsigned short subs;
+  unsigned short w, h;    /* size at glTexImage2D time */
+  unsigned char bpp;      /* bytes per texel of the created storage */
+  unsigned char subs_window; /* glTexSubImage2D calls this 60-frame window */
+  unsigned last_sub_frame; /* frame of the last glTexSubImage2D, +1 */
 } tex_info[TEX_TRACK];
+
+/* vitaGL orphans a texture on glTexSubImage2D when it was drawn within the
+ * last FRAME_PURGE_FREQ frames: it allocates a whole new surface and copies
+ * the ENTIRE texture before applying the sub-rect (textures.c ~line 982).
+ * Vita3K nor the CPU throttle can see that cost -- it is host-side memcpy in
+ * the emulator and memory stalls, not instructions, on the Vita. Estimate it:
+ * the first sub-upload to a texture each frame counts one full-surface copy
+ * (after the orphan vitaGL clears last_frame, so later subs in the same frame
+ * are free until it is drawn again). */
+static unsigned orphan_bytes_window, orphan_copies_window;
+
+/* "Does the AGB compositor re-upload tiles that did not change?" -- remember
+ * the last uploads and count exact repeats (same texture, rect and content). */
+static struct {
+  unsigned short tex;
+  unsigned short x, y, w, h;
+  unsigned sum;
+} sub_ring[32];
+static unsigned sub_ring_pos, redundant_subs_window;
 
 
 extern GLuint probe_texture;
@@ -2087,6 +2203,8 @@ static void glVertexPointerHook(GLint size, GLenum type, GLsizei stride,
   glVertexPointer(size, type, stride, ptr);
 }
 
+#endif /* FF6_DEBUG */
+
 /* ==========================================================================
  * GL_FIXED colour arrays
  *
@@ -2105,6 +2223,19 @@ static void glVertexPointerHook(GLint size, GLenum type, GLsizei stride,
  * time expand the range being drawn into floats and hand vitaGL a plain
  * GL_FLOAT array.
  * ======================================================================== */
+
+/* Texture coordinates arrive as GL_FIXED too, and there the problem is
+ * precision rather than a missing format. vitaGL declares the attribute float
+ * and has the generated vertex shader rebuild the value:
+ *
+ *     GLFixedToFloat(fx) = short2(fx).y + ushort2(fx).x * (1.0 / 65536.0)
+ *
+ * If that expression, or the TEXCOORD varying carrying its result, ends up at
+ * half precision, the mantissa is 10 bits -- about 1/1024, which on a 1024
+ * wide atlas is exactly one texel. At a tile edge the sample then lands in the
+ * neighbouring cell, which is the thin seam visible along tile boundaries.
+ * Converting on the CPU and handing over a real GL_FLOAT array keeps the
+ * vertex format identical while removing the shader-side unpack entirely. */
 
 typedef struct {
   GLint size;
@@ -2203,6 +2334,56 @@ static void glDrawArraysFixed(GLenum mode, GLint first, GLsizei count) {
   glDrawArrays(mode, first, count);
 }
 
+/* The engine rebinds a texture before every single draw -- measured at 117
+ * binds for 116 draws in a frame -- and a good share of those name the texture
+ * that is already bound. Under vitaGL a bind is not free: it dirties the
+ * fixed-function state and can send the next draw through reload_ffp_shaders.
+ * Swallowing the repeats is safe and costs one comparison. */
+static GLuint bound_texture_2d = 0;
+
+unsigned gl_binds_skipped;
+unsigned gl_binds_real;
+
+/* For binds the loader itself issues: keeps the cache honest. */
+static void bind_texture_2d(GLuint texture) {
+  bound_texture_2d = texture;
+  glBindTexture(GL_TEXTURE_2D, texture);
+}
+
+static void glBindTextureHook(GLenum target, GLuint texture) {
+#ifdef FF6_DEBUG
+  /* Instrumentation's view of the game's intended binding. Must update even
+   * when the bind is skipped below, and got lost in the skip-cache rewrite:
+   * with it stuck at 0 every per-texture stat piled onto tex_info[0]. */
+  if (target == GL_TEXTURE_2D)
+    gl_bound_texture = texture;
+#endif
+  if (target == GL_TEXTURE_2D) {
+    if (texture == bound_texture_2d) {
+      gl_binds_skipped++;
+      return;
+    }
+    bound_texture_2d = texture;
+  }
+
+#ifdef FF6_DEBUG
+  gl_binds_real++;
+#endif
+  glBindTexture(target, texture);
+}
+
+/* Two ways the skip cache above can go stale: deleting the bound texture
+ * unbinds it inside GL (and the id can be handed out again), and a bind on
+ * another texture unit changes which binding glBindTexture(GL_TEXTURE_2D)
+ * refers to. Either would make the skip eat a REAL bind and send every
+ * following upload to the wrong texture. Invalidate on both. */
+static void glDeleteTexturesHook(GLsizei n, const GLuint *textures) {
+  for (GLsizei i = 0; i < n; i++)
+    if (textures[i] == bound_texture_2d)
+      bound_texture_2d = 0xFFFFFFFFu;
+  glDeleteTextures(n, textures);
+}
+
 static void glTexCoordPointerHook(GLint size, GLenum type, GLsizei stride,
                                   const void *ptr) {
   gl_uv.size = size;
@@ -2210,16 +2391,20 @@ static void glTexCoordPointerHook(GLint size, GLenum type, GLsizei stride,
   gl_uv.stride = stride;
   gl_uv.ptr = ptr;
 
+#ifdef FF6_DEBUG
   gl_tex.size = size;
   gl_tex.type = type;
   gl_tex.stride = stride;
   gl_tex.ptr = ptr;
+#endif
 
   /* Unlike colours, vitaGL does accept GL_FIXED here, so pass it through: if a
    * draw ends up not going through the conversion the original pointer is
    * still valid and behaves as before. */
   glTexCoordPointer(size, type, stride, ptr);
 }
+
+#ifdef FF6_DEBUG
 
 static struct {
   unsigned frames;
@@ -2231,6 +2416,9 @@ static struct {
   int last_viewport[4];
   float last_ortho[6];
   unsigned draws_this_frame;
+  unsigned binds_this_frame;
+  unsigned draws_window;
+  unsigned binds_window;
   unsigned max_draws;
 } gl_stats;
 
@@ -2478,170 +2666,7 @@ static void glClearHook(GLbitfield mask) {
   }
 }
 
-/* The engine re-sets the viewport to the value it already has several times a
- * frame, and only the draws issued after the last one survive. Swallow the
- * redundant calls so a no-op cannot disturb the scene. */
-/* How many bytes one pixel occupies for the format/type pairs this game uses.
- * Only what upload_summary needs; anything unknown reports as 4. */
-static int pixel_bytes(GLenum format, GLenum type) {
-  if (type == 0x8033 /* UNSIGNED_SHORT_4_4_4_4 */ ||
-      type == 0x8034 /* UNSIGNED_SHORT_5_5_5_1 */ ||
-      type == 0x8363 /* UNSIGNED_SHORT_5_6_5 */)
-    return 2;
-  if (format == GL_ALPHA || format == GL_LUMINANCE)
-    return 1;
-  if (format == GL_LUMINANCE_ALPHA)
-    return 2;
-  if (format == GL_RGB)
-    return 3;
-  return 4;
-}
-
-/* Sample the upload sparsely: enough to tell "all black/transparent" from
- * "real image" without touching every byte of a 2048x2048 atlas. */
-static void upload_summary(const char *what, GLsizei width, GLsizei height,
-                           GLenum format, GLenum type, const void *pixels) {
-  static int logged;
-  if (what[0] != 's' && logged > 220)
-    return;
-  logged++;
-
-  if (!pixels) {
-    trace("[tex] %s tex=%u %dx%d fmt=0x%x type=0x%x pixels=NULL\n", what,
-          gl_bound_texture, width, height, format, type);
-    return;
-  }
-
-  const unsigned char *p = (const unsigned char *)pixels;
-  size_t total = (size_t)width * height * pixel_bytes(format, type);
-  size_t step = total > 4096 ? total / 4096 : 1;
-  /* An even step locks the sampling to one byte lane of every pixel -- with a
-     4-byte pixel and a step that is a multiple of 4 it would never see the
-     alpha channel at all. Keep it odd so the samples rotate through lanes. */
-  if (step > 1 && (step & 1) == 0)
-    step++;
-  size_t nonzero = 0, samples = 0;
-  unsigned char maxv = 0;
-
-  for (size_t i = 0; i < total; i += step, samples++) {
-    if (p[i]) {
-      nonzero++;
-      if (p[i] > maxv)
-        maxv = p[i];
-    }
-  }
-
-  trace("[tex] %s tex=%u %dx%d fmt=0x%x type=0x%x nonzero=%u/%u max=%u\n",
-        what, gl_bound_texture, width, height, format, type,
-        (unsigned)nonzero, (unsigned)samples, maxv);
-
-  if (gl_bound_texture < TEX_TRACK && width >= 64 && maxv == 255 &&
-      nonzero * 4 >= samples * 3)
-    tex_info[gl_bound_texture].bright = 1;
-}
-
-static void glTexImage2DHook(GLenum target, GLint level, GLint internalformat,
-                             GLsizei width, GLsizei height, GLint border,
-                             GLenum format, GLenum type, const void *pixels) {
-  gl_stats.textures++;
-  MARK1("glTexImage2D", (unsigned)(width << 16 | height));
-  if (gl_bound_texture < TEX_TRACK) {
-    tex_info[gl_bound_texture].created_with_data = pixels ? 1 : 0;
-    tex_info[gl_bound_texture].subs = 0;
-  }
-  upload_summary("img", width, height, format, type, pixels);
-  glTexImage2D(target, level, internalformat, width, height, border, format,
-               type, pixels);
-}
-
-static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
-                                GLint yoffset, GLsizei width, GLsizei height,
-                                GLenum format, GLenum type,
-                                const void *pixels) {
-  gl_stats.tex_subs++;
-  if (gl_dump_frame && gl_stats.frames == gl_dump_frame)
-    trace("[frm] -- TEXSUB tex=%u %dx%d at (%d,%d) after %u draws --\n",
-          gl_bound_texture, width, height, xoffset, yoffset,
-          gl_stats.draws_this_frame);
-
-  /* The AGB compositor's tile atlases (created empty, filled by these calls)
-     are the game screen's actual content. Sample what is being uploaded: if
-     it is all zeros the game area is invisible no matter what the draws do. */
-  {
-    static int logged;
-    if (logged < 400) {
-      logged++;
-      upload_summary("sub", width, height, format, type, pixels);
-    }
-  }
-  if (gl_bound_texture < TEX_TRACK && tex_info[gl_bound_texture].subs < 0xffff)
-    tex_info[gl_bound_texture].subs++;
-  glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
-                  pixels);
-}
-
-/* The engine rebinds a texture before every single draw -- measured at 117
- * binds for 116 draws in a frame -- and a good share of those name the texture
- * that is already bound. Under vitaGL a bind is not free: it dirties the
- * fixed-function state and can send the next draw through reload_ffp_shaders.
- * Swallowing the repeats is safe and costs one comparison. */
-static GLuint bound_texture_2d = 0;
-
-unsigned gl_binds_skipped;
-unsigned gl_binds_real;
-
-/* For binds the loader itself issues: keeps the cache honest. */
-static void bind_texture_2d(GLuint texture) {
-  bound_texture_2d = texture;
-  glBindTexture(GL_TEXTURE_2D, texture);
-}
-
-static void glBindTextureHook(GLenum target, GLuint texture) {
-  /* Instrumentation's view of the game's intended binding. Must update even
-   * when the bind is skipped below. */
-  if (target == GL_TEXTURE_2D)
-    gl_bound_texture = texture;
-  gl_stats.binds++;
-  if (target == GL_TEXTURE_2D) {
-    if (texture == bound_texture_2d) {
-      gl_binds_skipped++;
-      return;
-    }
-    bound_texture_2d = texture;
-  }
-
-  gl_binds_real++;
-  glBindTexture(target, texture);
-}
-
-/* Two ways the skip cache above can go stale: deleting the bound texture
- * unbinds it inside GL (and the id can be handed out again), and a bind on
- * another texture unit changes which binding glBindTexture(GL_TEXTURE_2D)
- * refers to. Either would make the skip eat a REAL bind and send every
- * following upload to the wrong texture. Invalidate on both. */
-static void glDeleteTexturesHook(GLsizei n, const GLuint *textures) {
-  for (GLsizei i = 0; i < n; i++)
-    if (textures[i] == bound_texture_2d)
-      bound_texture_2d = 0xFFFFFFFFu;
-  glDeleteTextures(n, textures);
-}
-
-
-static void glActiveTextureHook(GLenum unit) {
-  if (unit != gl_active_unit) {
-    static int logged;
-    if (logged < 24) {
-      trace("[gl] frame %u: glActiveTexture(0x%x) after %u draws\n",
-            gl_stats.frames, unit, gl_stats.draws_this_frame);
-      logged++;
-    }
-    gl_active_unit = unit;
-    /* glBindTexture(GL_TEXTURE_2D,...) now refers to another unit's binding:
-     * the skip cache no longer knows what is bound. */
-    bound_texture_2d = 0xFFFFFFFFu;
-  }
-  glActiveTexture(unit);
-}
+#endif /* FF6_DEBUG */
 
 /* Size of the engine's own composition space, taken from whatever ortho it
  * last set up (480x320 for this game). Kept outside the debug block because
@@ -2841,6 +2866,17 @@ static void glCompressedTexImage2DHook(GLenum target, GLint level,
 
         glTexImage2D(target, level < 0 ? 0 : level, GL_RGBA, width, height,
                      border, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+
+#ifdef FF6_DEBUG
+        /* The expansion bypasses glTexImage2DHook, so record the storage here
+         * or the orphan-traffic estimate misses every palette-born atlas. */
+        if (gl_bound_texture < TEX_TRACK) {
+          tex_info[gl_bound_texture].w = (unsigned short)width;
+          tex_info[gl_bound_texture].h = (unsigned short)height;
+          tex_info[gl_bound_texture].bpp = 4;
+          tex_info[gl_bound_texture].last_sub_frame = 0;
+        }
+#endif
 
         free(palette);
         free(rgba);
@@ -3100,10 +3136,12 @@ static void glViewportHook(GLint x, GLint y, GLsizei w, GLsizei h) {
   cur[1] = y;
   cur[2] = w;
   cur[3] = h;
+#ifdef FF6_DEBUG
   gl_stats.last_viewport[0] = x;
   gl_stats.last_viewport[1] = y;
   gl_stats.last_viewport[2] = w;
   gl_stats.last_viewport[3] = h;
+#endif
   glViewport(x, y, w, h);
 }
 
@@ -3123,17 +3161,200 @@ static SOFTFP_ABI void glOrthofHook(GLfloat l, GLfloat r, GLfloat b, GLfloat t,
     ortho_base_h = bh;
   }
 
+#ifdef FF6_DEBUG
   gl_stats.last_ortho[0] = l;
   gl_stats.last_ortho[1] = r;
   gl_stats.last_ortho[2] = b;
   gl_stats.last_ortho[3] = t;
   gl_stats.last_ortho[4] = n;
   gl_stats.last_ortho[5] = f;
+#endif
   glOrthof(l, r, b, t, n, f);
+}
+
+#ifdef FF6_DEBUG
+
+/* How many bytes one pixel occupies for the format/type pairs this game uses.
+ * Only what upload_summary needs; anything unknown reports as 4. */
+static int pixel_bytes(GLenum format, GLenum type) {
+  if (type == 0x8033 /* UNSIGNED_SHORT_4_4_4_4 */ ||
+      type == 0x8034 /* UNSIGNED_SHORT_5_5_5_1 */ ||
+      type == 0x8363 /* UNSIGNED_SHORT_5_6_5 */)
+    return 2;
+  if (format == GL_ALPHA || format == GL_LUMINANCE)
+    return 1;
+  if (format == GL_LUMINANCE_ALPHA)
+    return 2;
+  if (format == GL_RGB)
+    return 3;
+  return 4;
+}
+
+/* Sample the upload sparsely: enough to tell "all black/transparent" from
+ * "real image" without touching every byte of a 2048x2048 atlas. */
+static void upload_summary(const char *what, GLsizei width, GLsizei height,
+                           GLenum format, GLenum type, const void *pixels) {
+  static int logged;
+  /* Battle sprite textures are allocated late, well past the boot-time cap, so
+   * always report those: whether their per-frame refresh carries pixels is the
+   * whole question about the invisible party. */
+  int always = gl_bound_texture >= 300;
+  if (!always && what[0] != 's' && logged > 220)
+    return;
+  if (!always)
+    logged++;
+
+  if (!pixels) {
+    trace("[tex] %s tex=%u %dx%d fmt=0x%x type=0x%x pixels=NULL\n", what,
+          gl_bound_texture, width, height, format, type);
+    return;
+  }
+
+  const unsigned char *p = (const unsigned char *)pixels;
+  size_t total = (size_t)width * height * pixel_bytes(format, type);
+  size_t step = total > 4096 ? total / 4096 : 1;
+  /* An even step locks the sampling to one byte lane of every pixel -- with a
+     4-byte pixel and a step that is a multiple of 4 it would never see the
+     alpha channel at all. Keep it odd so the samples rotate through lanes. */
+  if (step > 1 && (step & 1) == 0)
+    step++;
+  size_t nonzero = 0, samples = 0;
+  unsigned char maxv = 0;
+
+  for (size_t i = 0; i < total; i += step, samples++) {
+    if (p[i]) {
+      nonzero++;
+      if (p[i] > maxv)
+        maxv = p[i];
+    }
+  }
+
+  trace("[tex] %s tex=%u %dx%d fmt=0x%x type=0x%x nonzero=%u/%u max=%u\n",
+        what, gl_bound_texture, width, height, format, type,
+        (unsigned)nonzero, (unsigned)samples, maxv);
+
+  if (gl_bound_texture < TEX_TRACK && width >= 64 && maxv == 255 &&
+      nonzero * 4 >= samples * 3)
+    tex_info[gl_bound_texture].bright = 1;
+}
+
+static unsigned char gl_upload_bpp(GLenum format, GLenum type) {
+  if (type == GL_UNSIGNED_SHORT_5_6_5 || type == GL_UNSIGNED_SHORT_4_4_4_4 ||
+      type == GL_UNSIGNED_SHORT_5_5_5_1)
+    return 2;
+  switch (format) {
+  case GL_RGBA: return 4;
+  case GL_RGB: return 3;
+  case GL_LUMINANCE_ALPHA: return 2;
+  default: return 1;
+  }
+}
+
+static void glTexImage2DHook(GLenum target, GLint level, GLint internalformat,
+                             GLsizei width, GLsizei height, GLint border,
+                             GLenum format, GLenum type, const void *pixels) {
+  gl_stats.textures++;
+  MARK1("glTexImage2D", (unsigned)(width << 16 | height));
+  if (gl_bound_texture < TEX_TRACK) {
+    tex_info[gl_bound_texture].created_with_data = pixels ? 1 : 0;
+    tex_info[gl_bound_texture].subs = 0;
+    tex_info[gl_bound_texture].w = (unsigned short)width;
+    tex_info[gl_bound_texture].h = (unsigned short)height;
+    tex_info[gl_bound_texture].bpp = gl_upload_bpp(format, type);
+    tex_info[gl_bound_texture].last_sub_frame = 0;
+  }
+  upload_summary("img", width, height, format, type, pixels);
+  glTexImage2D(target, level, internalformat, width, height, border, format,
+               type, pixels);
+}
+
+static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
+                                GLint yoffset, GLsizei width, GLsizei height,
+                                GLenum format, GLenum type,
+                                const void *pixels) {
+  gl_stats.tex_subs++;
+  if (gl_dump_frame && gl_stats.frames == gl_dump_frame)
+    trace("[frm] -- TEXSUB tex=%u %dx%d at (%d,%d) after %u draws --\n",
+          gl_bound_texture, width, height, xoffset, yoffset,
+          gl_stats.draws_this_frame);
+
+  /* The AGB compositor's tile atlases (created empty, filled by these calls)
+     are the game screen's actual content. Sample what is being uploaded: if
+     it is all zeros the game area is invisible no matter what the draws do. */
+  {
+    static int logged;
+    static int battle_logged;
+    if (logged < 400) {
+      logged++;
+      upload_summary("sub", width, height, format, type, pixels);
+    } else if (gl_bound_texture >= 300 && battle_logged < 60) {
+      battle_logged++;
+      upload_summary("sub", width, height, format, type, pixels);
+    }
+  }
+  if (gl_bound_texture < TEX_TRACK && tex_info[gl_bound_texture].subs < 0xffff)
+    tex_info[gl_bound_texture].subs++;
+  if (gl_bound_texture < TEX_TRACK && tex_info[gl_bound_texture].subs_window < 0xff)
+    tex_info[gl_bound_texture].subs_window++;
+
+  if (gl_bound_texture < TEX_TRACK && tex_info[gl_bound_texture].bpp) {
+    /* One whole-surface orphan copy per texture per frame, vitaGL-style:
+     * height x align(width,8) x bpp of the FULL texture, not the rect. */
+    if (tex_info[gl_bound_texture].last_sub_frame != gl_stats.frames + 1) {
+      tex_info[gl_bound_texture].last_sub_frame = gl_stats.frames + 1;
+      orphan_bytes_window += (unsigned)tex_info[gl_bound_texture].h *
+                             (((unsigned)tex_info[gl_bound_texture].w + 7) & ~7u) *
+                             tex_info[gl_bound_texture].bpp;
+      orphan_copies_window++;
+    }
+  }
+
+  if (pixels && width > 0 && height > 0) {
+    const unsigned char *p = (const unsigned char *)pixels;
+    unsigned n = (unsigned)width * (unsigned)height * gl_upload_bpp(format, type);
+    unsigned sum = 2166136261u;
+    for (unsigned i = 0; i < n; i++)
+      sum = (sum ^ p[i]) * 16777619u;
+    for (unsigned i = 0; i < 32; i++) {
+      if (sub_ring[i].tex == gl_bound_texture && sub_ring[i].x == xoffset &&
+          sub_ring[i].y == yoffset && sub_ring[i].w == width &&
+          sub_ring[i].h == height && sub_ring[i].sum == sum) {
+        redundant_subs_window++;
+        break;
+      }
+    }
+    sub_ring[sub_ring_pos & 31] = {(unsigned short)gl_bound_texture,
+                                   (unsigned short)xoffset,
+                                   (unsigned short)yoffset,
+                                   (unsigned short)width,
+                                   (unsigned short)height, sum};
+    sub_ring_pos++;
+  }
+
+  glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
+                  pixels);
+}
+
+static void glActiveTextureHook(GLenum unit) {
+  if (unit != gl_active_unit) {
+    static int logged;
+    if (logged < 24) {
+      trace("[gl] frame %u: glActiveTexture(0x%x) after %u draws\n",
+            gl_stats.frames, unit, gl_stats.draws_this_frame);
+      logged++;
+    }
+    gl_active_unit = unit;
+    /* glBindTexture(GL_TEXTURE_2D,...) now refers to another unit's binding:
+     * the skip cache no longer knows what is bound. */
+    bound_texture_2d = 0xFFFFFFFFu;
+  }
+  glActiveTexture(unit);
 }
 
 extern "C" uint32_t vgl_debug_scene_splits;
 extern "C" uint32_t vgl_debug_log_draws;
+
+unsigned glyph_uploads;
 
 static void gl_stats_report(void) {
   MARK("eglSwapBuffers");
@@ -3168,20 +3389,64 @@ static void gl_stats_report(void) {
   }
   if (gl_stats.draws_this_frame > gl_stats.max_draws)
     gl_stats.max_draws = gl_stats.draws_this_frame;
+
+  /* Rolling average over the reporting window, so a line describes the scene
+   * on screen rather than the whole run. */
+  gl_stats.draws_window += gl_stats.draws_this_frame;
+  gl_stats.binds_window += gl_binds_real; gl_binds_real = 0;
   gl_stats.draws_this_frame = 0;
+  gl_stats.binds_this_frame = 0;
 
   if (gl_stats.frames % 60)
     return;
 
-  trace("[gl] frame %u draws=%u (max/frame %u) clears=%u tex=%u sub=%u "
-        "binds=%u vp=%d,%d %dx%d ortho=%d..%d,%d..%d\n",
-        gl_stats.frames, gl_stats.draws, gl_stats.max_draws, gl_stats.clears,
-        gl_stats.textures, gl_stats.tex_subs, gl_stats.binds,
+  /* Say WHERE this was measured. A number with no scene attached is how I
+   * ended up quoting a battle when the question was about the town. */
+  extern int ff6_current_map(void);
+
+  trace("[gl] frame %u map=%d draws/frame=%u binds/frame=%u skipped=%u "
+        "(peak %u) tex=%u sub=%u glyphs=%u vp=%d,%d %dx%d "
+        "orphan=%uKB/f(%u/f) redup=%u/60f\n",
+        gl_stats.frames, ff6_current_map(), gl_stats.draws_window / 60,
+        gl_stats.binds_window / 60, gl_binds_skipped, gl_stats.max_draws,
+        gl_stats.textures, gl_stats.tex_subs, glyph_uploads,
         gl_stats.last_viewport[0], gl_stats.last_viewport[1],
         gl_stats.last_viewport[2], gl_stats.last_viewport[3],
-        (int)gl_stats.last_ortho[0], (int)gl_stats.last_ortho[1],
-        (int)gl_stats.last_ortho[2], (int)gl_stats.last_ortho[3]);
+        orphan_bytes_window / 60 / 1024, (orphan_copies_window + 30) / 60,
+        redundant_subs_window);
+  gl_stats.draws_window = 0;
+  gl_stats.binds_window = 0;
+  gl_binds_skipped = 0;
+  orphan_bytes_window = 0;
+  orphan_copies_window = 0;
+  redundant_subs_window = 0;
+
+  /* Who is receiving those sub-uploads, and how big is the surface vitaGL
+   * would orphan-copy for each. One line per window keeps it greppable. */
+  {
+    char line[200];
+    int pos = 0, listed = 0;
+    for (unsigned t = 0; t < TEX_TRACK && listed < 8; t++) {
+      if (!tex_info[t].subs_window)
+        continue;
+      int n = snprintf(line + pos, sizeof(line) - pos, " %u(%ux%ux%u):%u", t,
+                       tex_info[t].w, tex_info[t].h, tex_info[t].bpp,
+                       tex_info[t].subs_window);
+      tex_info[t].subs_window = 0;
+      if (n < 0 || pos + n >= (int)sizeof(line) - 1)
+        break;
+      pos += n;
+      listed++;
+    }
+    /* Clear any leftovers past the print budget so windows stay disjoint. */
+    for (unsigned t = 0; t < TEX_TRACK; t++)
+      tex_info[t].subs_window = 0;
+    if (listed)
+      trace("[glsub] frame %u map=%d%s\n", gl_stats.frames, ff6_current_map(),
+            line);
+  }
 }
+#endif /* FF6_DEBUG */
 
 /* ==========================================================================
  * Symbol table
@@ -3255,14 +3520,16 @@ static so_default_dynlib default_dynlib[] = {
     {"eglTerminate", (uintptr_t)&fake_eglTerminate},
 
     /* GLES 1.x */
-    {"glActiveTexture", (uintptr_t)&glActiveTextureHook},
+    {"glActiveTexture",
+     DBG_ALT((uintptr_t)&glActiveTextureHook, (uintptr_t)&glActiveTexture)},
     {"glAlphaFunc", WRAP(glAlphaFunc)},
-    {"glBindTexture", (uintptr_t)&glBindTextureHook},
+    {"glBindTexture",
+     DBG_ALT((uintptr_t)&glBindTextureHook, (uintptr_t)&glBindTexture)},
     {"glBlendFunc", (uintptr_t)&glBlendFunc},
-    {"glClear", (uintptr_t)&glClearHook},
+    {"glClear", DBG_ALT((uintptr_t)&glClearHook, (uintptr_t)&glClear)},
     {"glClearColor", WRAP(glClearColor)},
     {"glClearDepthf", WRAP(glClearDepthf)},
-    {"glColor4f", (uintptr_t)&glColor4fHook},
+    {"glColor4f", DBG_ALT((uintptr_t)&glColor4fHook, WRAP(glColor4f))},
     {"glColorMask", (uintptr_t)&glColorMask},
     {"glColorPointer", (uintptr_t)&glColorPointerHook},
     {"glCompressedTexImage2D", (uintptr_t)&glCompressedTexImage2DHook},
@@ -3271,10 +3538,13 @@ static so_default_dynlib default_dynlib[] = {
     {"glDepthFunc", (uintptr_t)&glDepthFunc},
     {"glDepthMask", (uintptr_t)&glDepthMask},
     {"glDisable", (uintptr_t)&glDisable},
-    {"glDisableClientState", (uintptr_t)&glDisableClientStateHook},
-    {"glDrawArrays", (uintptr_t)&glDrawArraysHook},
+    {"glDisableClientState", DBG_ALT((uintptr_t)&glDisableClientStateHook,
+                                     (uintptr_t)&glDisableClientState)},
+    {"glDrawArrays",
+     DBG_ALT((uintptr_t)&glDrawArraysHook, (uintptr_t)&glDrawArraysFixed)},
     {"glEnable", (uintptr_t)&glEnable},
-    {"glEnableClientState", (uintptr_t)&glEnableClientStateHook},
+    {"glEnableClientState", DBG_ALT((uintptr_t)&glEnableClientStateHook,
+                                    (uintptr_t)&glEnableClientState)},
     {"glFogf", WRAP(glFogf)},
     {"glFogfv", (uintptr_t)&glFogfv},
     {"glFrontFace", (uintptr_t)&glFrontFace},
@@ -3300,13 +3570,16 @@ static so_default_dynlib default_dynlib[] = {
     {"glScissor", (uintptr_t)&glScissor},
     {"glShadeModel", (uintptr_t)&glShadeModel},
     {"glTexCoordPointer", (uintptr_t)&glTexCoordPointerHook},
-    {"glTexEnvf", (uintptr_t)&glTexEnvfHook},
-    {"glTexImage2D", (uintptr_t)&glTexImage2DHook},
+    {"glTexEnvf", DBG_ALT((uintptr_t)&glTexEnvfHook, WRAP(glTexEnvf))},
+    {"glTexImage2D",
+     DBG_ALT((uintptr_t)&glTexImage2DHook, (uintptr_t)&glTexImage2D)},
     {"glTexParameterf", (uintptr_t)&glTexParameterfHook},
     {"glTexParameteri", (uintptr_t)&glTexParameteriHook},
-    {"glTexSubImage2D", (uintptr_t)&glTexSubImage2DHook},
+    {"glTexSubImage2D",
+     DBG_ALT((uintptr_t)&glTexSubImage2DHook, (uintptr_t)&glTexSubImage2D)},
     {"glTranslatef", WRAP(glTranslatef)},
-    {"glVertexPointer", (uintptr_t)&glVertexPointerHook},
+    {"glVertexPointer",
+     DBG_ALT((uintptr_t)&glVertexPointerHook, (uintptr_t)&glVertexPointer)},
     {"glViewport", (uintptr_t)&glViewportHook},
 
     /* zlib */
@@ -3355,13 +3628,13 @@ static so_default_dynlib default_dynlib[] = {
     {"feof", (uintptr_t)&feof},
     {"fflush", (uintptr_t)&fflush_hook},
     {"floor", WRAP((double (*)(double))floor)},
-    {"fopen", (uintptr_t)&fopen_mark},
+    {"fopen", DBG_ALT((uintptr_t)&fopen_mark, (uintptr_t)&fopen_fake)},
     {"fprintf", (uintptr_t)&fprintf_hook},
     {"fputc", (uintptr_t)&fputc_hook},
-    {"fread", (uintptr_t)&fread_mark},
+    {"fread", DBG_ALT((uintptr_t)&fread_mark, (uintptr_t)&fread)},
     {"free", (uintptr_t)&free},
     {"frexp", WRAP((double (*)(double, int *))frexp)},
-    {"fseek", (uintptr_t)&fseek_mark},
+    {"fseek", DBG_ALT((uintptr_t)&fseek_mark, (uintptr_t)&fseek)},
     {"ftell", (uintptr_t)&ftell},
     {"fwrite", (uintptr_t)&fwrite},
     {"gettimeofday", (uintptr_t)&gettimeofday},
@@ -3378,7 +3651,7 @@ static so_default_dynlib default_dynlib[] = {
     {"modf", WRAP((double (*)(double, double *))modf)},
     {"munmap", (uintptr_t)&munmap_fake},
     {"nanosleep", (uintptr_t)&nanosleep_fake},
-    {"open", (uintptr_t)&open_fake},
+    {"open", DBG_ALT((uintptr_t)&open_mark, (uintptr_t)&open_fake)},
     {"pipe", (uintptr_t)&ret0},
     {"pow", WRAP((double (*)(double, double))pow)},
     {"powf", WRAP(powf)},
@@ -3413,7 +3686,7 @@ static so_default_dynlib default_dynlib[] = {
     {"strtol", (uintptr_t)&strtol},
     {"tanf", WRAP(tanf)},
     {"time", (uintptr_t)&time},
-    {"usleep", (uintptr_t)&usleep_mark},
+    {"usleep", DBG_ALT((uintptr_t)&usleep_mark, (uintptr_t)&usleep_fake)},
     {"vsprintf", (uintptr_t)&vsprintf},
     {"write", (uintptr_t)&write},
 
@@ -3425,7 +3698,8 @@ static so_default_dynlib default_dynlib[] = {
     {"pthread_cond_destroy", (uintptr_t)&pthread_cond_destroy_fake},
     {"pthread_cond_init", (uintptr_t)&pthread_cond_init_fake},
     {"pthread_cond_signal", (uintptr_t)&pthread_cond_signal_fake},
-    {"pthread_cond_wait", (uintptr_t)&cond_wait_mark},
+    {"pthread_cond_wait",
+     DBG_ALT((uintptr_t)&cond_wait_mark, (uintptr_t)&pthread_cond_wait_fake)},
     {"pthread_create", (uintptr_t)&pthread_create_fake},
     {"pthread_detach", (uintptr_t)&pthread_detach},
     {"pthread_equal", (uintptr_t)&pthread_equal},
@@ -3436,7 +3710,8 @@ static so_default_dynlib default_dynlib[] = {
     {"pthread_key_delete", (uintptr_t)&pthread_key_delete},
     {"pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy_fake},
     {"pthread_mutex_init", (uintptr_t)&pthread_mutex_init_fake},
-    {"pthread_mutex_lock", (uintptr_t)&mutex_lock_mark},
+    {"pthread_mutex_lock",
+     DBG_ALT((uintptr_t)&mutex_lock_mark, (uintptr_t)&pthread_mutex_lock_fake)},
     {"pthread_mutex_unlock", (uintptr_t)&pthread_mutex_unlock_fake},
     {"pthread_mutexattr_destroy", (uintptr_t)&pthread_mutexattr_destroy_fake},
     {"pthread_mutexattr_init", (uintptr_t)&pthread_mutexattr_init_fake},
@@ -3470,11 +3745,19 @@ static int (*ff6_MotionPointFlag)(int);
 static uint8_t *ff6_system_mode;
 static uint8_t *ff6_maincnt;
 static uint8_t *ff6_loadhaltflag;
+static uint8_t *ff6_savehaltflag;
+static int (*ff6_checkIsEmptyHalt)(void);
 static uint8_t *ff6_ishaltdata;
 static uint8_t *ff6_loaded_flag;
 static uint8_t *ff6_opening_loop;
 static uint8_t *ff6_Bg0Disp;
 static uint16_t *ff6_AgbIo;
+
+/* The engine's own idea of where the player is, so a measurement can name its
+ * scene. Returns -1 before the symbol is resolved or outside the field. */
+int ff6_current_map(void) {
+  return ff6_getFieldMapNo ? ff6_getFieldMapNo() : -1;
+}
 
 static void resolve_symbols(void) {
   g_app = (uint8_t *)so_symbol(&ff6_mod, "g_app");
@@ -3500,6 +3783,9 @@ static void resolve_symbols(void) {
   ff6_system_mode = (uint8_t *)so_symbol(&ff6_mod, "system_mode");
   ff6_maincnt = (uint8_t *)so_symbol(&ff6_mod, "maincnt");
   ff6_loadhaltflag = (uint8_t *)so_symbol(&ff6_mod, "loadhaltflag");
+  ff6_savehaltflag = (uint8_t *)so_symbol(&ff6_mod, "savehaltflag");
+  ff6_checkIsEmptyHalt = (int (*)(void))so_symbol(&ff6_mod,
+                                                 "MobileCheckIsEmptyHalt");
   ff6_ishaltdata = (uint8_t *)so_symbol(&ff6_mod, "ishaltdata");
   ff6_loaded_flag = (uint8_t *)so_symbol(&ff6_mod, "__loaded_flag");
   ff6_opening_loop = (uint8_t *)so_symbol(&ff6_mod, "opening_loop");
@@ -3526,6 +3812,7 @@ static void resolve_symbols(void) {
  * game writes a real save the first time the player saves. */
 static void *(*ff6_saveMgrInstance)(void);
 static int (*ff6_getResultReadFromFile)(void *self, int slot);
+static void (*ff6_writeToFile)(void *self);
 
 static int file_exists(const char *path);
 
@@ -3611,12 +3898,49 @@ static void drawGlyphHook(void *self, int idx, int *pixels) {
   glTexSubImage2D(GL_TEXTURE_2D, 0, xoff, yoff, w, h, GL_RGBA,
                   GL_UNSIGNED_BYTE, buf);
 
+#ifdef FF6_DEBUG
+  /* Rate, not just content: the engine sizes the atlas as (1024/cell)^2, so a
+   * bigger cell means fewer slots. If it runs out it re-registers glyphs
+   * continuously and every one of those costs a rasterization plus an upload,
+   * which is a CPU cost that Vita3K on a desktop would hide entirely. A count
+   * that keeps climbing long after the text settled is thrashing. */
+  glyph_uploads++;
+
   static int logged;
   if (logged < 12) {
     logged++;
-    trace("[glyph] uploaded idx=%d %dx%d at (%d,%d) tex=%u page=%d\n", idx, w,
-          h, xoff, yoff, handle, page);
+    trace("[glyph] uploaded idx=%d %dx%d at (%d,%d) tex=%u page=%d cell=%d "
+          "slots=%d\n",
+          idx, w, h, xoff, yoff, handle, page, cell, per_row * per_row);
+
+    /* What the .so actually hands us: if RGB is zero everywhere the engine
+       never ORs a colour in and the glyph is a pure coverage mask, which no
+       amount of MODULATE can turn into the outlined two-tone font the real
+       game shows. Distinct ARGB values, most frequent first. */
+    unsigned vals[8] = {0};
+    unsigned counts[8] = {0};
+    int nvals = 0;
+    for (int y = 0; y < h; y++) {
+      for (int x = 0; x < w; x++) {
+        unsigned v = (unsigned)buf[y * w + x];
+        int seen = 0;
+        for (int i = 0; i < nvals; i++)
+          if (vals[i] == v) {
+            counts[i]++;
+            seen = 1;
+            break;
+          }
+        if (!seen && nvals < 8) {
+          vals[nvals] = v;
+          counts[nvals] = 1;
+          nvals++;
+        }
+      }
+    }
+    for (int i = 0; i < nvals; i++)
+      trace("[glyph]   argb=0x%08x x%u\n", vals[i], counts[i]);
   }
+#endif
 }
 
 static void patch_game(void) {
@@ -3624,6 +3948,8 @@ static void patch_game(void) {
       &ff6_mod, "_ZN19cMobileSaveLoadMngr11getInstanceEv");
   ff6_getResultReadFromFile = (int (*)(void *, int))so_symbol(
       &ff6_mod, "_ZN19cMobileSaveLoadMngr21getResultReadFromFileEi");
+  ff6_writeToFile = (void (*)(void *))so_symbol(
+      &ff6_mod, "_ZN19cMobileSaveLoadMngr11writeToFileEv");
 
   hook_addr(so_symbol(&ff6_mod, "ReadSaveDataResult"),
             (uintptr_t)&ReadSaveDataResultHook);
@@ -3831,6 +4157,10 @@ static int main_thread(SceSize args, void *argp) {
   trace("[ff6] initGame...\n");
   ff6_initGame();
   trace("[ff6] initGame done, entering input loop\n");
+  trace("[res] engine render=%dx%d screen=%dx%d (vita %dx%d)\n",
+        *engine_field(ENGINE_RENDER_W), *engine_field(ENGINE_RENDER_H),
+        *engine_field(ENGINE_SCREEN_W), *engine_field(ENGINE_SCREEN_H),
+        SCREEN_W, SCREEN_H);
 
   if (ff6_inputGamePadSetActive)
     ff6_inputGamePadSetActive(1);
@@ -3839,6 +4169,74 @@ static int main_thread(SceSize args, void *argp) {
   for (int tick = 0;; tick++) {
     pump_touch();
     pump_buttons();
+#ifdef FF6_DEBUG
+    /* Quicksave is the engine's "halt data". Watch the flag that requests one
+     * and whether the buffer stops being empty, so a failed quicksave says
+     * whether it even got as far as staging the data in memory. */
+    {
+      static int last_save = -1, last_empty = -1;
+      int sf = ff6_savehaltflag ? *ff6_savehaltflag : -1;
+      int em = ff6_checkIsEmptyHalt ? ff6_checkIsEmptyHalt() : -1;
+      if (sf != last_save || em != last_empty) {
+        trace("[halt] savehaltflag=%d isEmpty=%d loadhalt=%d\n", sf, em,
+              ff6_loadhaltflag ? *ff6_loadhaltflag : -1);
+        last_save = sf;
+        last_empty = em;
+      }
+    }
+
+    /* Exercise the save path without driving the menus: dropping
+     * ux0:data/ff6/save.trigger calls the engine's own writeToFile(), which is
+     * the same routine the save menu ends up in. Answers "does it write the
+     * file at all" on its own. */
+    {
+      static int check;
+      if ((++check & 0x3f) == 0) {
+        SceIoStat st;
+        if (sceIoGetstat(DATA_PATH "/save.trigger", &st) >= 0) {
+          sceIoRemove(DATA_PATH "/save.trigger");
+          if (ff6_saveMgrInstance && ff6_writeToFile) {
+            void *mgr = ff6_saveMgrInstance();
+            trace("[save] writeToFile() sobre instancia %p\n", mgr);
+            ff6_writeToFile(mgr);
+            trace("[save] writeToFile() retorno\n");
+          } else {
+            trace("[save] simbolos no resueltos (mgr=%p write=%p)\n",
+                  (void *)ff6_saveMgrInstance, (void *)ff6_writeToFile);
+          }
+        }
+      }
+    }
+
+    /* Unattended run: with ux0:data/ff6/autoplay.trigger present, tap confirm
+     * on a slow cadence so the opening plays itself through to the first
+     * scripted battle. The battle sprites are the only thing that exercises
+     * the paletted-texture path, and it cannot be reached from a screenshot. */
+    {
+      static int autoplay = -1;
+      if (autoplay < 0) {
+        SceIoStat st;
+        autoplay = sceIoGetstat(DATA_PATH "/autoplay.trigger", &st) >= 0;
+        if (autoplay)
+          trace("[auto] autoplay armed\n");
+      }
+      if (autoplay) {
+        /* Tap confirm to clear dialogue, and walk north the rest of the time:
+         * from the Narshe entrance that runs into the guards that start the
+         * first battle. */
+        int phase = tick % 200;
+        if (phase == 0) {
+          send_key(96 /* BUTTON_A */, 1);
+        } else if (phase == 8) {
+          send_key(96, 0);
+        } else if (phase == 20) {
+          send_key(19 /* DPAD_UP */, 1);
+        } else if (phase == 190) {
+          send_key(19, 0);
+        }
+      }
+    }
+
     {
       static unsigned seen_frames;
       static int stalled_for;
@@ -3875,6 +4273,7 @@ static int main_thread(SceSize args, void *argp) {
       trace("[state]   BLDCNT=0x%04x BLDALPHA=0x%04x BLDY=0x%04x\n", bldcnt,
             bldalpha, bldy);
     }
+#endif /* FF6_DEBUG */
     sceKernelDelayThread(4000);
   }
 

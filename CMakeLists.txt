@@ -18,6 +18,11 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wl,-q,--wrap,memcpy,--wrap,memmove,--wrap,memset -Wall -O3 -mfloat-abi=hard")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++17")
 
+option(FF6_DEBUG "Build with the black-screen-hunt instrumentation (GL logging, probes, watchdog, boot.log tracing)" OFF)
+if(FF6_DEBUG)
+  add_definitions(-DFF6_DEBUG)
+endif()
+
 set(VPK_FILE_ARGS
   ${CMAKE_SOURCE_DIR}/NotoSansJP-Regular.ttf NotoSansJP-Regular.ttf
   ${CMAKE_SOURCE_DIR}/NotoSansSC-Regular.ttf NotoSansSC-Regular.ttf
