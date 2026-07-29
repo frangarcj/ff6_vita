@@ -52,6 +52,13 @@ typedef struct {
                       * stretching it to the 816x544 pillarbox. Only whole
                       * multiples keep source pixels the same size on screen,
                       * which is what GL_NEAREST needs to look even. */
+  int inplace_tex;   /* 1 = vglInPlaceTexSubImage: the AGB compositor streams
+                      * tile strips into two 1024x2048 RGBA atlases while they
+                      * are being drawn, and vitaGL's default response is to
+                      * orphan the texture -- an 8 MB uncached full-surface
+                      * copy, ~5 MB/frame while the town scrolls. Writing in
+                      * place skips that; the strips entering view are not
+                      * sampled by the frames still in flight. */
 } config_opts;
 
 extern config_opts options;

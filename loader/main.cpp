@@ -112,6 +112,7 @@ static void set_default_options(void) {
   options.integer_scale = 0;
   options.offscreen = 0;
   options.font_scale = 100;
+  options.inplace_tex = 1;
 }
 
 static void loadOptions(void) {
@@ -143,6 +144,8 @@ static void loadOptions(void) {
       options.offscreen = value;
     else if (strcmp("fontscale", key) == 0)
       options.font_scale = value > 0 ? value : 100;
+    else if (strcmp("inplacetex", key) == 0)
+      options.inplace_tex = value;
   }
 
   fclose(f);
@@ -3763,6 +3766,13 @@ static int main_thread(SceSize args, void *argp) {
   trace("[ff6] vglInitExtended...\n");
   vglInitExtended(0, SCREEN_W, SCREEN_H,
                   MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, msaa);
+
+  /* The AGB compositor streams tile strips into two 1024x2048 atlases it is
+   * also drawing from; vitaGL's orphan-on-modify turns each first strip of a
+   * frame into an 8 MB uncached copy (~5 MB/frame while the town scrolls),
+   * which is the Narshe slowdown. Write in place instead. */
+  if (options.inplace_tex)
+    vglInPlaceTexSubImage(GL_TRUE);
 
   trace("[ff6] resolve_symbols...\n");
   resolve_symbols();
