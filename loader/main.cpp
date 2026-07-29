@@ -2601,12 +2601,181 @@ static void glActiveTextureHook(GLenum unit) {
   glActiveTexture(unit);
 }
 
+/* ==========================================================================
+ * Paletted textures
+ *
+ * Battle party sprites are created as GL_PALETTE8_RGBA8_OES through
+ * glCompressedTexImage2D, and then refreshed every frame with
+ * glTexSubImage2D(GL_RGBA, GL_UNSIGNED_BYTE) -- see drawDataCellBlend and
+ * updateTextureDataCellWithTexID in the .so. Android GLES drivers expand
+ * paletted textures to RGBA8 at upload, so that later RGBA sub-upload lands
+ * on an RGBA8 surface and works.
+ *
+ * vitaGL instead keeps a real 1-byte-per-texel indexed surface with a separate
+ * palette, so the RGBA sub-upload stores only each source pixel's red byte as
+ * a palette index. Expanding here restores the Android behaviour: hand vitaGL
+ * a normal RGBA8 texture and every later sub-upload is correct. The game never
+ * calls glGetError or checks GL_EXTENSIONS, so it cannot tell the difference.
+ * ======================================================================== */
+
+#define GL_PALETTE4_RGB8_OES_ 0x8B90
+#define GL_PALETTE4_RGBA8_OES_ 0x8B91
+#define GL_PALETTE4_R5_G6_B5_OES_ 0x8B92
+#define GL_PALETTE4_RGBA4_OES_ 0x8B93
+#define GL_PALETTE4_RGB5_A1_OES_ 0x8B94
+#define GL_PALETTE8_RGB8_OES_ 0x8B95
+#define GL_PALETTE8_RGBA8_OES_ 0x8B96
+#define GL_PALETTE8_R5_G6_B5_OES_ 0x8B97
+#define GL_PALETTE8_RGBA4_OES_ 0x8B98
+#define GL_PALETTE8_RGB5_A1_OES_ 0x8B99
+
+static int paletted_layout(GLenum fmt, int *entries, int *entry_bytes,
+                           int *four_bit) {
+  switch (fmt) {
+  case GL_PALETTE4_RGB8_OES_:
+  case GL_PALETTE4_RGBA8_OES_:
+  case GL_PALETTE4_R5_G6_B5_OES_:
+  case GL_PALETTE4_RGBA4_OES_:
+  case GL_PALETTE4_RGB5_A1_OES_:
+    *entries = 16;
+    *four_bit = 1;
+    break;
+  case GL_PALETTE8_RGB8_OES_:
+  case GL_PALETTE8_RGBA8_OES_:
+  case GL_PALETTE8_R5_G6_B5_OES_:
+  case GL_PALETTE8_RGBA4_OES_:
+  case GL_PALETTE8_RGB5_A1_OES_:
+    *entries = 256;
+    *four_bit = 0;
+    break;
+  default:
+    return 0;
+  }
+
+  switch (fmt) {
+  case GL_PALETTE4_RGB8_OES_:
+  case GL_PALETTE8_RGB8_OES_:
+    *entry_bytes = 3;
+    break;
+  case GL_PALETTE4_RGBA8_OES_:
+  case GL_PALETTE8_RGBA8_OES_:
+    *entry_bytes = 4;
+    break;
+  default:
+    *entry_bytes = 2;
+    break;
+  }
+  return 1;
+}
+
+static void decode_palette_entry(GLenum fmt, const unsigned char *e,
+                                 unsigned char *out) {
+  switch (fmt) {
+  case GL_PALETTE4_RGB8_OES_:
+  case GL_PALETTE8_RGB8_OES_:
+    out[0] = e[0];
+    out[1] = e[1];
+    out[2] = e[2];
+    out[3] = 255;
+    break;
+  case GL_PALETTE4_RGBA8_OES_:
+  case GL_PALETTE8_RGBA8_OES_:
+    out[0] = e[0];
+    out[1] = e[1];
+    out[2] = e[2];
+    out[3] = e[3];
+    break;
+  case GL_PALETTE4_R5_G6_B5_OES_:
+  case GL_PALETTE8_R5_G6_B5_OES_: {
+    unsigned v = (unsigned)e[0] | ((unsigned)e[1] << 8);
+    out[0] = (unsigned char)(((v >> 11) & 0x1F) * 255 / 31);
+    out[1] = (unsigned char)(((v >> 5) & 0x3F) * 255 / 63);
+    out[2] = (unsigned char)((v & 0x1F) * 255 / 31);
+    out[3] = 255;
+    break;
+  }
+  case GL_PALETTE4_RGBA4_OES_:
+  case GL_PALETTE8_RGBA4_OES_: {
+    unsigned v = (unsigned)e[0] | ((unsigned)e[1] << 8);
+    out[0] = (unsigned char)(((v >> 12) & 0xF) * 255 / 15);
+    out[1] = (unsigned char)(((v >> 8) & 0xF) * 255 / 15);
+    out[2] = (unsigned char)(((v >> 4) & 0xF) * 255 / 15);
+    out[3] = (unsigned char)((v & 0xF) * 255 / 15);
+    break;
+  }
+  default: { /* RGB5_A1 */
+    unsigned v = (unsigned)e[0] | ((unsigned)e[1] << 8);
+    out[0] = (unsigned char)(((v >> 11) & 0x1F) * 255 / 31);
+    out[1] = (unsigned char)(((v >> 6) & 0x1F) * 255 / 31);
+    out[2] = (unsigned char)(((v >> 1) & 0x1F) * 255 / 31);
+    out[3] = (v & 1) ? 255 : 0;
+    break;
+  }
+  }
+}
+
 static void glCompressedTexImage2DHook(GLenum target, GLint level,
                                        GLenum internalformat, GLsizei width,
                                        GLsizei height, GLint border,
                                        GLsizei imageSize, const void *data) {
-  trace("[gl] compressed tex fmt=0x%x %dx%d size=%d\n", internalformat, width,
-        height, imageSize);
+  int entries, entry_bytes, four_bit;
+
+  if (paletted_layout(internalformat, &entries, &entry_bytes, &four_bit) &&
+      data && width > 0 && height > 0) {
+    size_t palette_bytes = (size_t)entries * entry_bytes;
+    size_t index_bytes =
+        four_bit ? (((size_t)width + 1) / 2) * height : (size_t)width * height;
+
+    if ((size_t)imageSize >= palette_bytes + index_bytes) {
+      unsigned char (*palette)[4] =
+          (unsigned char (*)[4])malloc((size_t)entries * 4);
+      unsigned char *rgba =
+          (unsigned char *)malloc((size_t)width * height * 4);
+
+      if (palette && rgba) {
+        const unsigned char *src = (const unsigned char *)data;
+        for (int i = 0; i < entries; i++)
+          decode_palette_entry(internalformat, src + (size_t)i * entry_bytes,
+                               palette[i]);
+
+        const unsigned char *idx = src + palette_bytes;
+        for (int y = 0; y < height; y++) {
+          for (int x = 0; x < width; x++) {
+            unsigned p;
+            if (four_bit) {
+              unsigned char byte = idx[(size_t)y * ((width + 1) / 2) + x / 2];
+              p = (x & 1) ? (byte & 0x0F) : (byte >> 4);
+            } else {
+              p = idx[(size_t)y * width + x];
+            }
+            unsigned char *out = &rgba[((size_t)y * width + x) * 4];
+            out[0] = palette[p][0];
+            out[1] = palette[p][1];
+            out[2] = palette[p][2];
+            out[3] = palette[p][3];
+          }
+        }
+
+        glTexImage2D(target, level < 0 ? 0 : level, GL_RGBA, width, height,
+                     border, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+
+        free(palette);
+        free(rgba);
+
+        static int logged;
+        if (logged < 8) {
+          logged++;
+          trace("[pal] expanded 0x%x %dx%d to RGBA8\n", internalformat, width,
+                height);
+        }
+        return;
+      }
+
+      free(palette);
+      free(rgba);
+    }
+  }
+
   glCompressedTexImage2D(target, level, internalformat, width, height, border,
                          imageSize, data);
 }
