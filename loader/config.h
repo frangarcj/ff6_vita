@@ -52,6 +52,10 @@ typedef struct {
                       * stretching it to the 816x544 pillarbox. Only whole
                       * multiples keep source pixels the same size on screen,
                       * which is what GL_NEAREST needs to look even. */
+  int fixed_color_native; /* 1 = pass GL_FIXED colour arrays straight to the
+                           * vitaGL fork, which unpacks 16.16 in its generated
+                           * vertex shader; 0 = expand to floats in the loader
+                           * at draw time (works on stock vitaGL too). */
   int inplace_tex;   /* 1 = vglInPlaceTexSubImage: the AGB compositor streams
                       * tile strips into two 1024x2048 RGBA atlases while they
                       * are being drawn, and vitaGL's default response is to

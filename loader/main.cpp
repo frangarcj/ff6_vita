@@ -113,6 +113,7 @@ static void set_default_options(void) {
   options.offscreen = 0;
   options.font_scale = 100;
   options.inplace_tex = 1;
+  options.fixed_color_native = 0;
 }
 
 static void loadOptions(void) {
@@ -146,6 +147,8 @@ static void loadOptions(void) {
       options.font_scale = value > 0 ? value : 100;
     else if (strcmp("inplacetex", key) == 0)
       options.inplace_tex = value;
+    else if (strcmp("fixedcolor", key) == 0)
+      options.fixed_color_native = value;
   }
 
   fclose(f);
@@ -2122,10 +2125,16 @@ static void glColorPointerHook(GLint size, GLenum type, GLsizei stride,
   gl_col.stride = stride;
   gl_col.ptr = ptr;
 
-  /* Hand GL_FIXED to vitaGL and it errors out and leaves the attribute
-   * misconfigured, so defer it to draw time instead. */
-  if (type == GL_FIXED)
-    return;
+  /* Stock vitaGL rejects GL_FIXED here and leaves the attribute
+   * misconfigured, so the loader defers it to draw time and hands vitaGL a
+   * float copy. Our vitaGL fork now unpacks 16.16 in its generated vertex
+   * shader (same trick it already used for positions and texcoords), which
+   * costs nothing per vertex; fixedcolor=1 in options.cfg uses that path. */
+  if (type == GL_FIXED) {
+    if (!options.fixed_color_native)
+      return;
+    gl_col.type = 0; /* nothing pending for draw-time conversion */
+  }
 
   glColorPointer(size, type, stride, ptr);
 }
