@@ -2901,15 +2901,38 @@ static int (*ff6_getResultReadFromFile)(void *self, int slot);
 
 static int file_exists(const char *path);
 
-static int ReadSaveDataResultHook(void) {
-  /* Only paper over the genuine first-run case. If save files exist, defer to
-   * the real accessor so actual corruption still gets reported. */
-  if (!file_exists(SAVE_PATH "/RockDat0.sav") &&
-      !file_exists(SAVE_PATH "/RockDat1.sav"))
+/* The engine writes RockDat<slot>.sav, one file per slot, so checking two
+ * fixed names was wrong: save in any other slot and this decided there was no
+ * data at all. Scan the range the save menu can reach, plus the unsuffixed
+ * name the .so carries as its built-in fallback. */
+static int any_save_file_exists(void) {
+  if (file_exists(SAVE_PATH "/RockDat.sav"))
     return 1;
 
+  for (int slot = 0; slot < 16; slot++) {
+    char path[64];
+    snprintf(path, sizeof(path), SAVE_PATH "/RockDat%d.sav", slot);
+    if (file_exists(path))
+      return 1;
+  }
+  return 0;
+}
+
+static int ReadSaveDataResultHook(void) {
+  /* The original is a one line tail call: getResultReadFromFile(instance, -1).
+   * Run that first and keep its answer -- it is the one the save and load
+   * menus rely on, and second-guessing it is how a real save gets reported as
+   * missing. Only the genuine first run gets papered over, and only when the
+   * engine is about to take the damaged-data path. */
+  int result = 1;
   if (ff6_saveMgrInstance && ff6_getResultReadFromFile)
-    return ff6_getResultReadFromFile(ff6_saveMgrInstance(), -1);
+    result = ff6_getResultReadFromFile(ff6_saveMgrInstance(), -1);
+
+  if (result <= 1)
+    return result;
+
+  if (any_save_file_exists())
+    return result;
 
   return 1;
 }
