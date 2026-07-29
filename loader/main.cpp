@@ -100,11 +100,17 @@ void *__wrap_memmove(void *dest, const void *src, size_t n) {
 void *__wrap_memset(void *s, int c, size_t n) { return sceClibMemset(s, c, n); }
 }
 
+/* Defined further down with the offscreen buffer; the swap needs these. */
+static void present_scene_fbo(void);
+static void bind_scene_fbo(void);
+
 static void set_default_options(void) {
   options.bilinear = 0;
   options.lang = 0;
   options.msaa = 2;
   options.sound = 1;
+  options.integer_scale = 0;
+  options.offscreen = 0;
   options.font_scale = 100;
 }
 
@@ -131,6 +137,10 @@ static void loadOptions(void) {
       options.msaa = value;
     else if (strcmp("sound", key) == 0)
       options.sound = value;
+    else if (strcmp("integerscale", key) == 0)
+      options.integer_scale = value;
+    else if (strcmp("offscreen", key) == 0)
+      options.offscreen = value;
     else if (strcmp("fontscale", key) == 0)
       options.font_scale = value > 0 ? value : 100;
   }
@@ -1672,7 +1682,17 @@ static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
 
   /* The IME dialog has to be composited by the Vita's own display stack, so we
    * ask vitaGL to keep the framebuffer around while it is up. */
+  /* If the frame never switched to the panels' viewport the world is still in
+   * the offscreen buffer; put it on screen before presenting. */
+  present_scene_fbo();
+
   vglSwapBuffers(isInputDialogOpen() ? GL_TRUE : GL_FALSE);
+
+  /* Redirect the next frame's world into the offscreen buffer. This has to
+   * happen here, between frames: vitaGL only picks up a render target change
+   * when it starts a scene, so binding once drawing is under way is ignored
+   * and the world ends up on the display anyway. */
+  bind_scene_fbo();
 
   /* Freeze exactly once, right after presenting a frame whose scene phase
      drew a bright opaque quad. Whatever is on screen during this pause IS
@@ -1698,23 +1718,25 @@ static void ANativeWindow_setBuffersGeometry(void *window, int w, int h,
  * GL shims
  * ======================================================================== */
 
+/* Texture filtering is ours to decide, not the engine's. The Android build
+ * asks for GL_LINEAR on the sprite atlases, which on a 960x544 panel smears
+ * 16x16 pixel art into mush. With the bilinear option off we force GL_NEAREST
+ * instead of merely passing the request through, so characters and tiles stay
+ * crisp; with it on the old smoothed look is still available. */
+static GLint filter_override(GLenum pname, GLint param) {
+  if (pname != GL_TEXTURE_MIN_FILTER && pname != GL_TEXTURE_MAG_FILTER)
+    return param;
+  return options.bilinear == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
+}
+
 static void glTexParameteriHook(GLenum target, GLenum pname, GLint param) {
-  if (options.bilinear &&
-      (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER)) {
-    glTexParameteri(target, pname, GL_LINEAR);
-    return;
-  }
-  glTexParameteri(target, pname, param);
+  glTexParameteri(target, pname, filter_override(pname, param));
 }
 
 static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
                                            GLfloat param) {
-  if (options.bilinear &&
-      (pname == GL_TEXTURE_MIN_FILTER || pname == GL_TEXTURE_MAG_FILTER)) {
-    glTexParameterf(target, pname, (GLfloat)GL_LINEAR);
-    return;
-  }
-  glTexParameterf(target, pname, param);
+  glTexParameterf(target, pname,
+                  (GLfloat)filter_override(pname, (GLint)param));
 }
 
 /* vitaGL has no fixed-function light model; the game only ever sets the global
@@ -2447,41 +2469,6 @@ static void glClearHook(GLbitfield mask) {
 /* The engine re-sets the viewport to the value it already has several times a
  * frame, and only the draws issued after the last one survive. Swallow the
  * redundant calls so a no-op cannot disturb the scene. */
-static void glViewportHook(GLint x, GLint y, GLsizei w, GLsizei h) {
-  static GLint cur[4] = {-1, -1, -1, -1};
-
-  if (gl_dump_frame && gl_stats.frames == gl_dump_frame)
-    trace("[frm] -- VIEWPORT %d,%d %dx%d after %u draws%s --\n", x, y, w, h,
-          gl_stats.draws_this_frame,
-          (x == cur[0] && y == cur[1] && w == cur[2] && h == cur[3])
-              ? " (redundant, skipped)"
-              : "");
-
-  if (x == cur[0] && y == cur[1] && w == cur[2] && h == cur[3])
-    return;
-
-  cur[0] = x;
-  cur[1] = y;
-  cur[2] = w;
-  cur[3] = h;
-  gl_stats.last_viewport[0] = x;
-  gl_stats.last_viewport[1] = y;
-  gl_stats.last_viewport[2] = w;
-  gl_stats.last_viewport[3] = h;
-  glViewport(x, y, w, h);
-}
-
-static SOFTFP_ABI void glOrthofHook(GLfloat l, GLfloat r, GLfloat b, GLfloat t,
-                                    GLfloat n, GLfloat f) {
-  gl_stats.last_ortho[0] = l;
-  gl_stats.last_ortho[1] = r;
-  gl_stats.last_ortho[2] = b;
-  gl_stats.last_ortho[3] = t;
-  gl_stats.last_ortho[4] = n;
-  gl_stats.last_ortho[5] = f;
-  glOrthof(l, r, b, t, n, f);
-}
-
 /* How many bytes one pixel occupies for the format/type pairs this game uses.
  * Only what upload_summary needs; anything unknown reports as 4. */
 static int pixel_bytes(GLenum format, GLenum type) {
@@ -2642,6 +2629,47 @@ static void glActiveTextureHook(GLenum unit) {
     bound_texture_2d = 0xFFFFFFFFu;
   }
   glActiveTexture(unit);
+}
+
+/* Size of the engine's own composition space, taken from whatever ortho it
+ * last set up (480x320 for this game). Kept outside the debug block because
+ * integer scaling derives the pixel grid from it. */
+static int ortho_base_w = 0;
+static int ortho_base_h = 0;
+
+/* Snap a viewport to a whole multiple of the composition space, centred on the
+ * rectangle the engine asked for. At 480x320 into 816x544 the engine's own
+ * scale is 1.7x, so a source pixel lands on either one or two screen pixels
+ * depending on where it falls -- with GL_NEAREST that is visible as uneven,
+ * shimmering pixel sizes. Dropping to the largest whole multiple that fits
+ * trades screen area for a uniform grid. */
+static int integer_scale_viewport(GLint *x, GLint *y, GLsizei *w, GLsizei *h) {
+  if (!options.integer_scale || ortho_base_w <= 0 || ortho_base_h <= 0)
+    return 0;
+
+  /* Only the world. The side panels are laid out in screen coordinates under a
+   * full-screen viewport, and shrinking that one too dragged the clock and the
+   * battery inside the game area instead of leaving them at the edges. */
+  if (*w >= SCREEN_W && *h >= SCREEN_H)
+    return 0;
+
+  int scale = *w / ortho_base_w;
+  int scale_y = *h / ortho_base_h;
+  if (scale_y < scale)
+    scale = scale_y;
+  if (scale < 1)
+    return 0;
+
+  GLsizei sw = (GLsizei)(ortho_base_w * scale);
+  GLsizei sh = (GLsizei)(ortho_base_h * scale);
+  if (sw == *w && sh == *h)
+    return 0; /* already exact */
+
+  *x += (*w - sw) / 2;
+  *y += (*h - sh) / 2;
+  *w = sw;
+  *h = sh;
+  return 1;
 }
 
 /* ==========================================================================
@@ -2821,6 +2849,275 @@ static void glCompressedTexImage2DHook(GLenum target, GLint level,
 
   glCompressedTexImage2D(target, level, internalformat, width, height, border,
                          imageSize, data);
+}
+
+/* ==========================================================================
+ * Draw the world offscreen, stretch it once
+ *
+ * Stretching 480x320 straight into the 816x544 pillarbox is a 1.7x scale, and
+ * at a fractional scale the sample for a pixel on a tile border can land in
+ * the neighbouring cell of the atlas -- the thin seams visible along tile
+ * edges. Confirmed by running at a whole 1x, where the seams disappear.
+ *
+ * So render the world into an offscreen buffer at exactly its own size, where
+ * sampling is 1:1 and no seam can form, and stretch that one texture to the
+ * pillarbox afterwards. The stretch is a single filtered quad, and it does
+ * not resample the atlas at all.
+ *
+ * It should also be faster, not slower: the world is drawn into 480x320
+ * instead of 816x544, which is under half the fragments. (An earlier note
+ * here claimed 1x on hardware ran at 60fps where 1.7x ran at 10; that
+ * measurement was wrong -- 1x does not rescue the framerate on hardware.)
+ *
+ * The side panels are not part of this. The engine draws them in screen space
+ * under a full-screen viewport after the world, so they go straight to the
+ * display and stay pixel exact.
+ * ======================================================================== */
+
+static GLuint scene_fbo = 0;
+static GLuint scene_tex = 0;
+static GLuint scene_depth = 0;
+static int scene_w = 0;
+static int scene_h = 0;
+static int scene_bound = 0;
+static GLint scene_rect[4]; /* where on screen the buffer has to land */
+
+static int scene_fbo_wanted(void) {
+  return options.offscreen && ortho_base_w > 0 && ortho_base_h > 0;
+}
+
+static int ensure_scene_fbo(void) {
+  if (scene_fbo && scene_w == ortho_base_w && scene_h == ortho_base_h)
+    return 1;
+
+  if (scene_fbo) {
+    glDeleteFramebuffers(1, &scene_fbo);
+    glDeleteTextures(1, &scene_tex);
+    glDeleteRenderbuffers(1, &scene_depth);
+    scene_fbo = scene_tex = scene_depth = 0;
+  }
+
+  glGenTextures(1, &scene_tex);
+  bind_texture_2d(scene_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ortho_base_w, ortho_base_h, 0,
+               GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+  /* The one surface that genuinely wants filtering. */
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+  /* Battles are the only path that uses depth, and dropping it here would
+   * break exactly the scene this buffer holds. */
+  glGenRenderbuffers(1, &scene_depth);
+  glBindRenderbuffer(GL_RENDERBUFFER, scene_depth);
+  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, ortho_base_w,
+                        ortho_base_h);
+
+  glGenFramebuffers(1, &scene_fbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                         scene_tex, 0);
+  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                            GL_RENDERBUFFER, scene_depth);
+
+  GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+  if (status != GL_FRAMEBUFFER_COMPLETE) {
+    trace("[fbo] incomplete (0x%x); drawing straight to the display\n", status);
+    glDeleteFramebuffers(1, &scene_fbo);
+    glDeleteTextures(1, &scene_tex);
+    glDeleteRenderbuffers(1, &scene_depth);
+    scene_fbo = scene_tex = scene_depth = 0;
+    return 0;
+  }
+
+  scene_w = ortho_base_w;
+  scene_h = ortho_base_h;
+  trace("[fbo] world buffer %dx%d\n", scene_w, scene_h);
+  return 1;
+}
+
+/* Start a frame with the world redirected into the buffer. Called between
+ * frames so vitaGL picks the render target up when it opens the scene. */
+static void bind_scene_fbo(void) {
+  if (!scene_fbo_wanted() || !ensure_scene_fbo())
+    return;
+
+  glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
+  scene_bound = 1;
+#ifdef FF6_DEBUG
+  {
+    static int n;
+    if (n < 3) { n++; trace("[fbo] bind fbo=%u tex=%u\n", scene_fbo, scene_tex); }
+  }
+#endif
+  glViewport(0, 0, scene_w, scene_h);
+  /* The engine clears the display, never this buffer. */
+  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+/* Put the offscreen world on screen in the rectangle the engine asked for.
+ * Everything this touches is saved and restored: the engine is mid-frame and
+ * expects its own state back. */
+static void present_scene_fbo(void) {
+  if (!scene_bound)
+    return;
+  scene_bound = 0;
+
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glViewport(scene_rect[0], scene_rect[1], scene_rect[2], scene_rect[3]);
+
+  GLboolean had_blend = glIsEnabled(GL_BLEND);
+  GLboolean had_depth = glIsEnabled(GL_DEPTH_TEST);
+  GLboolean had_alpha = glIsEnabled(GL_ALPHA_TEST);
+  GLboolean had_cull = glIsEnabled(GL_CULL_FACE);
+  GLboolean had_col = glIsEnabled(GL_COLOR_ARRAY);
+  GLboolean had_tca = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+  GLboolean had_tex2d = glIsEnabled(GL_TEXTURE_2D);
+
+  glDisable(GL_BLEND);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_ALPHA_TEST);
+  glDisable(GL_CULL_FACE);
+  glDisableClientState(GL_COLOR_ARRAY);
+
+  /* The engine can leave the active unit elsewhere, and a texture matrix on
+   * unit 0 would move these coordinates. Pin both. */
+  glActiveTexture(GL_TEXTURE0);
+  glMatrixMode(GL_TEXTURE);
+  glPushMatrix();
+  glLoadIdentity();
+  /* Clip space directly, with both matrices identity: the quad then cannot be
+   * bent by whatever projection the engine had set. */
+  glMatrixMode(GL_PROJECTION);
+  glPushMatrix();
+  glLoadIdentity();
+  glMatrixMode(GL_MODELVIEW);
+  glPushMatrix();
+  glLoadIdentity();
+
+  glEnable(GL_TEXTURE_2D);
+  bind_texture_2d(scene_tex);
+  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+  glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
+
+  static const GLfloat quad[] = {-1, -1, 0, 1, -1, 0, -1, 1, 0, 1, 1, 0};
+  static const GLfloat uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
+
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+  glVertexPointer(3, GL_FLOAT, 0, quad);
+  glTexCoordPointer(2, GL_FLOAT, 0, uv);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+#ifdef FF6_DEBUG
+  {
+    static int n;
+    if (n < 3) { n++; trace("[fbo] blit tex=%u a (%d,%d %dx%d)\n", scene_tex,
+                            scene_rect[0], scene_rect[1], scene_rect[2], scene_rect[3]); }
+  }
+#endif
+
+  glMatrixMode(GL_PROJECTION);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+  glPopMatrix();
+  glMatrixMode(GL_TEXTURE);
+  glPopMatrix();
+  glMatrixMode(GL_MODELVIEW);
+
+  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+  if (!had_tex2d)
+    glDisable(GL_TEXTURE_2D);
+  if (!had_tca)
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+  if (had_col)
+    glEnableClientState(GL_COLOR_ARRAY);
+  if (had_blend)
+    glEnable(GL_BLEND);
+  if (had_depth)
+    glEnable(GL_DEPTH_TEST);
+  if (had_alpha)
+    glEnable(GL_ALPHA_TEST);
+  if (had_cull)
+    glEnable(GL_CULL_FACE);
+}
+
+/* The engine re-sets the viewport to the value it already has several times a
+ * frame. Swallowing the redundant calls costs nothing and keeps a no-op from
+ * touching renderer state mid-frame. */
+static void glViewportHook(GLint x, GLint y, GLsizei w, GLsizei h) {
+  static GLint cur[4] = {-1, -1, -1, -1};
+
+  integer_scale_viewport(&x, &y, &w, &h);
+
+  /* A viewport narrower than the screen is the world; a full-screen one is the
+   * side panels. Enter the offscreen buffer on the first, leave it on the
+   * second. */
+  if (scene_fbo_wanted()) {
+    int is_world = (w < SCREEN_W);
+
+    if (is_world) {
+      /* Remember where this has to end up, then redirect the world into the
+       * buffer. The bind itself happens at the top of the frame -- vitaGL
+       * only honours a render target change between scenes, so binding here
+       * left the world going to the display and the blit painted over it. */
+      scene_rect[0] = x;
+      scene_rect[1] = y;
+      scene_rect[2] = w;
+      scene_rect[3] = h;
+      if (scene_bound) {
+        cur[0] = cur[1] = cur[2] = cur[3] = -1;
+        glViewport(0, 0, scene_w, scene_h);
+        return;
+      }
+    }
+
+    if (!is_world && scene_bound) {
+      present_scene_fbo();
+      cur[0] = cur[1] = cur[2] = cur[3] = -1;
+    }
+  }
+
+  if (x == cur[0] && y == cur[1] && w == cur[2] && h == cur[3])
+    return;
+
+  cur[0] = x;
+  cur[1] = y;
+  cur[2] = w;
+  cur[3] = h;
+  gl_stats.last_viewport[0] = x;
+  gl_stats.last_viewport[1] = y;
+  gl_stats.last_viewport[2] = w;
+  gl_stats.last_viewport[3] = h;
+  glViewport(x, y, w, h);
+}
+
+static SOFTFP_ABI void glOrthofHook(GLfloat l, GLfloat r, GLfloat b, GLfloat t,
+                                    GLfloat n, GLfloat f) {
+  /* The engine's 2D composition space. Integer scaling needs it to know how
+   * big one source pixel is; ignore the odd projection so a stray setup does
+   * not redefine the grid. */
+  int bw = (int)(r - l < 0 ? l - r : r - l);
+  int bh = (int)(t - b < 0 ? b - t : t - b);
+  /* Only the engine's internal space, which is smaller than the screen. The
+   * side panels are laid out in screen coordinates and set an ortho the size
+   * of the display; taking that one as the base built an offscreen buffer at
+   * twice the screen size, mid-frame, every frame. */
+  if (bw > 0 && bh > 0 && (bw < SCREEN_W || bh < SCREEN_H)) {
+    ortho_base_w = bw;
+    ortho_base_h = bh;
+  }
+
+  gl_stats.last_ortho[0] = l;
+  gl_stats.last_ortho[1] = r;
+  gl_stats.last_ortho[2] = b;
+  gl_stats.last_ortho[3] = t;
+  gl_stats.last_ortho[4] = n;
+  gl_stats.last_ortho[5] = f;
+  glOrthof(l, r, b, t, n, f);
 }
 
 extern "C" uint32_t vgl_debug_scene_splits;
