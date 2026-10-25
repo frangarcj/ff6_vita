@@ -47,6 +47,10 @@ jobs:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - name: Trust only this mounted checkout inside the SDK container
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git rev-parse --verify HEAD
       - name: Build pinned dependencies in isolated SDK
         run: python3 tools/build_dependencies.py --directory build_ci/deps --jobs 4
       - name: Configure Release
@@ -60,12 +64,15 @@ jobs:
         run: |
           python3 tests/test_release_profile.py build_ci/FF6.elf
           python3 tests/test_release_profile.py build_ci/companion.elf
-          python3 tools/check_release.py build_ci --output release/ci
+          python3 tools/check_release.py build_ci --require-clean-source --output release/ci
           cd release/ci
           sha256sum -c SHA256SUMS
       - name: Artifact identity
         id: info
-        run: echo "artifact=FF6-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          revision="$(git rev-parse --short=8 HEAD)"
+          test "${#revision}" -ge 8
+          echo "artifact=FF6-$revision" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.info.outputs.artifact }}

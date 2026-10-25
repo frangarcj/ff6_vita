@@ -339,10 +339,17 @@ def main():
     parser.add_argument("build_dir", nargs="?", type=Path, default=Path("build_release"))
     parser.add_argument("--output", type=Path,
                         help="Stage the VPK, matching game/Configurator ELFs, manifest and checksums")
+    parser.add_argument("--require-clean-source", action="store_true",
+                        help="Reject unknown/dirty Git provenance (required for public CI releases)")
     args = parser.parse_args()
     build = args.build_dir.resolve()
     try:
         manifest = validate(build)
+        if args.require_clean_source:
+            require(isinstance(manifest["source_revision"], str) and
+                    re.fullmatch(r"[0-9a-f]{40}", manifest["source_revision"]) and
+                    manifest["source_dirty"] is False,
+                    "A public release requires a known, clean Git revision")
         if args.output is not None:
             output = args.output.resolve()
             require(output != build, "Output directory must differ from the build directory")

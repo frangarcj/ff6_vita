@@ -43,7 +43,8 @@ contains fixes for Android file-open flags, save paths and reading all save
 slots; older investigation notes that call saving broken predate or conflict
 with those changes. No completed save-persistence test is recorded yet.
 
-See [the release checklist](docs/RELEASE_CHECKLIST.md) for the acceptance gates,
+See [the public RC1 verification](docs/PUBLIC_RC1_VALIDATION.md) for Configurator,
+PostFX and workflow evidence, [the release checklist](docs/RELEASE_CHECKLIST.md) for the acceptance gates,
 [the RC2 report](docs/RC2_VALIDATION_2026-10-25.md) for the current evidence,
 [the RC1 report](docs/VALIDATION_2026-10-25.md) for earlier checks, and
 [HUNT.md](HUNT.md) for the historical investigation. Known limitations
@@ -182,6 +183,8 @@ It works without the commercial game files. Navigate with the gamepad, choose
 Save/exit and discard actions are also available. A failed save is reported
 instead of silently launching; comments and unknown configuration keys are
 preserved. Saved games are never written by the Configurator.
+
+![Configurator](docs/screenshots/configurator.png)
 
 The original 544p, native 3:2 layout remains the default. Higher output modes,
 alternative aspect ratios and PostFX are experimental until checked on your
@@ -393,7 +396,9 @@ command for `companion.elf` to exercise diagnostic rejection.
 
 `CI` builds pushes, pull requests, manual runs and `run_build` dispatches. It
 uses pinned source dependencies and uploads a verified VPK, symbols and
-provenance bundle. `Release` builds version tags, verifies the bundle's commit
+provenance bundle. Public CI uses `--require-clean-source` so an unknown Git
+revision or dirty checkout cannot silently produce a release bundle.
+`Release` builds version tags, verifies the bundle's commit
 and checksums, and publishes with `gh`. Tags ending in `-rcN` are prereleases,
 not the latest stable release. Existing releases/assets are never overwritten
 by the workflow; fixes require a new version tag. Actions are pinned by commit.
