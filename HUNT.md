@@ -1,5 +1,56 @@
 # Notas del port — estado al 2026-07-29 (sesión 4)
 
+> **Registro histórico; revisión para release de octubre de 2026.** Las notas
+> de abajo se conservan tal como quedaron y contienen hipótesis y estados ya
+> superados. El estado vigente y los criterios de aceptación están en
+> [README.md](README.md) y [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+> La candidata sigue pendiente de validación en consola.
+
+Puntos que hay que tener presentes al leer este registro:
+
+- Sí hubo pruebas en Vita real: el usuario confirmó Narshe fluido con
+  `inplacetex=1`. Falta verificar los menús, el combate y los bordes del scroll
+  después del último arreglo del puntero de colores.
+- El código incluye la traducción de flags Bionic y rutas de guardado
+  (`034c0c4`) y la corrección de lectura de todas las ranuras (`d603fcd`). La
+  sección antigua que dice que el quicksave falla antes de escribir no prueba
+  el estado actual: sigue pendiente un ciclo completo de guardar, salir,
+  arrancar y cargar, además de guardado rápido y reanudación.
+- Los únicos filtros admitidos son `bilinear=0` y `bilinear=1`; no hay opción
+  `aspect`. `offscreen=0` y `fixedcolor=0` son los valores de referencia. Las
+  alternativas experimentales no cuentan como verificadas por compilar.
+- El cambio de filtrado de octubre conserva `GL_LINEAR` en las dos páginas
+  de atlas de glifos registradas incluso con `bilinear=0`; el resto sigue la
+  opción general. Los handles se retiran al borrar o sustituir una página.
+  La ruta de texto completo `createTextTexture`/`drawText00` aún no se
+  clasifica como atlas. Hay regresión de host de la vida de los handles y
+  traza debug de MIN/MAG `LINEAR` para ambas páginas con `bilinear=0`;
+  la nueva build release también muestra legible el menú de reanudación,
+  sin letras perdidas ni solapamiento observado en esa pantalla. No se
+  aceptó la reanudación ni se validaron otras escenas con ese cambio.
+- La comparación con el checkout local de FF3 encontró las mismas fuentes
+  Noto y fuentes de stb por hash, pero `bilinear=0` allí conserva los filtros
+  pedidos por el motor. No se identificó un shader sharp-bilinear en ese
+  checkout. El blit offscreen de FF6 usa `GL_LINEAR` ordinario; no implementa
+  sharp-bilinear y no corrige una contaminación entre celdas ya compuesta.
+- La revisión de octubre vuelve a usar tamaño EM con
+  `stbtt_ScaleForMappingEmToPixels`: `fontscale=100` es el tamaño que pide el
+  motor Android. Se corrigen el descarte completo de glifos con bordes fuera
+  del bitmap, el límite artificial de subida de 64 píxeles y el wrap de fila
+  del atlas en el límite de capacidad. Hay regresiones de host y un menú de
+  reanudación revisado en Vita3K sin letras perdidas ni solapamiento observado;
+  faltan otras escenas y la validación en consola de esta versión.
+- No reutilizar el factor histórico 1,36 como medida de la fuente actual.
+  La JP incluida tiene ascent/descent `1160/-288` y `1000` unidades por EM:
+  el cambio desde pixel-height a EM da un factor de escala `1,448` sin el
+  límite de seguridad. El nuevo `fontscale=69` aproxima el antiguo `100`;
+  no es una calibración contra una captura Android. La caja vertical usa
+  ascent y descent redondeados por separado de Noto.
+- Los resultados de Vita3K documentan la investigación, pero no sustituyen
+  las pruebas de guardado, gráficos, rendimiento y suspensión en consola.
+
+---
+
 ## Sesión 4: el rendimiento de Narshe, CAZADO (pendiente de confirmar en consola)
 
 ### La causa: la orfandad de texturas de vitaGL, no los draws ni las subidas en sí

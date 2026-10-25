@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(DEFINED ENV{VITASDK})
@@ -23,10 +23,69 @@ if(FF6_DEBUG)
   add_definitions(-DFF6_DEBUG)
 endif()
 
+# These cache entries also allow a project-local build of the required fork,
+# without replacing the vitaGL installed in the SDK used by other projects.
+find_path(VITAGL_INCLUDE_DIR vitaGL.h
+  HINTS "${VITASDK}/arm-vita-eabi/include")
+find_library(VITAGL_LIBRARY NAMES vitaGL
+  HINTS "${VITASDK}/arm-vita-eabi/lib")
+if(NOT VITAGL_INCLUDE_DIR OR NOT VITAGL_LIBRARY)
+  message(FATAL_ERROR "vitaGL was not found. Set VITAGL_INCLUDE_DIR and VITAGL_LIBRARY.")
+endif()
+
+include(CheckCSourceCompiles)
+set(_ff6_required_includes "${CMAKE_REQUIRED_INCLUDES}")
+set(CMAKE_REQUIRED_INCLUDES "${VITAGL_INCLUDE_DIR}")
+set(_ff6_try_compile_target_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+unset(FF6_VITAGL_HAS_INPLACE_DECL CACHE)
+check_c_source_compiles("#include <vitaGL.h>
+int main(void) {
+  void (*required)(GLboolean) = &vglInPlaceTexSubImage;
+  return required == 0;
+}" FF6_VITAGL_HAS_INPLACE_DECL)
+if(_ff6_try_compile_target_type)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE "${_ff6_try_compile_target_type}")
+else()
+  unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+endif()
+set(CMAKE_REQUIRED_INCLUDES "${_ff6_required_includes}")
+if(NOT FF6_VITAGL_HAS_INPLACE_DECL)
+  message(FATAL_ERROR "This port needs the FF6 vitaGL patches: the selected header lacks vglInPlaceTexSubImage.")
+endif()
+
+# A declaration alone is not enough: mixing a fork header with an unpatched
+# SDK archive otherwise fails late, after compiling the entire loader.
+execute_process(COMMAND "${CMAKE_NM}" -g --defined-only "${VITAGL_LIBRARY}"
+  RESULT_VARIABLE _ff6_vitagl_nm_result
+  OUTPUT_VARIABLE _ff6_vitagl_symbols
+  ERROR_VARIABLE _ff6_vitagl_nm_error)
+if(NOT _ff6_vitagl_nm_result EQUAL 0 OR
+   NOT _ff6_vitagl_symbols MATCHES "[ \t][TW][ \t]+vglInPlaceTexSubImage([\r\n]|$)")
+  message(FATAL_ERROR "The selected vitaGL archive lacks vglInPlaceTexSubImage. Build the FF6 vitaGL patches and set VITAGL_LIBRARY. ${_ff6_vitagl_nm_error}")
+endif()
+if(FF6_DEBUG)
+  foreach(_ff6_debug_symbol vgl_debug_log_draws vgl_debug_scene_splits)
+    if(NOT _ff6_vitagl_symbols MATCHES "[ \t][BDR][ \t]+${_ff6_debug_symbol}([\r\n]|$)")
+      message(FATAL_ERROR "FF6_DEBUG requires vitaGL symbol ${_ff6_debug_symbol}; use the documented instrumented dependency build.")
+    endif()
+  endforeach()
+endif()
+
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/build_profile.c"
+  "#ifdef FF6_DEBUG\n"
+  "const char ff6_build_profile[] __attribute__((used)) = \"FF6_BUILD_PROFILE=debug\";\n"
+  "#else\n"
+  "const char ff6_build_profile[] __attribute__((used)) = \"FF6_BUILD_PROFILE=release\";\n"
+  "#endif\n")
+
 set(VPK_FILE_ARGS
   ${CMAKE_SOURCE_DIR}/NotoSansJP-Regular.ttf NotoSansJP-Regular.ttf
   ${CMAKE_SOURCE_DIR}/NotoSansSC-Regular.ttf NotoSansSC-Regular.ttf
   ${CMAKE_SOURCE_DIR}/NotoSansKR-Regular.ttf NotoSansKR-Regular.ttf
+  ${CMAKE_SOURCE_DIR}/LICENSE LICENSE
+  ${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.md
+  ${CMAKE_SOURCE_DIR}/licenses/OFL-Noto.txt licenses/OFL-Noto.txt
 )
 
 # LiveArea artwork is optional so the project builds before it exists.
@@ -43,18 +102,20 @@ foreach(livearea_file
 endforeach()
 
 add_executable(FF6.elf
+  ${CMAKE_CURRENT_BINARY_DIR}/build_profile.c
   loader/main.cpp
   loader/bridge.c
   loader/dialog.c
   loader/so_util.c
-  loader/stb_image.c
   loader/stb_truetype.c
 )
+
+target_include_directories(FF6.elf BEFORE PRIVATE "${VITAGL_INCLUDE_DIR}")
 
 target_link_libraries(FF6.elf
   m
   stdc++
-  vitaGL
+  "${VITAGL_LIBRARY}"
   vitashark
   mathneon
   kubridge_stub

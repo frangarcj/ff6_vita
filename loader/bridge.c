@@ -20,6 +20,8 @@
 
 #include "config.h"
 #include "dialog.h"
+#include "text_encoding.h"
+#include "font_raster.h"
 
 #include <stdarg.h>
 
@@ -235,20 +237,11 @@ static void update_metrics(void) {
     return;
   }
 
-  int ascent, descent, line_gap;
-  /* Keep (ascent - descent) equal to the requested size. Mapping the EM square
-   * to it instead -- which is what Paint.setTextSize() does on Android -- makes
-   * Noto Sans about 1.36x taller, and the engine spaces its lines on its own:
-   * measured against a capture of the real game, glyphs then covered 4.6% of
-   * the screen height against 3.2%, so lines ran into each other. At this
-   * scale they come out at 3.4%, which matches. */
-  paint_scale = stbtt_ScaleForPixelHeight(font_info, (float)paint_size);
-  if (options.font_scale > 0 && options.font_scale != 100)
-    paint_scale = paint_scale * (float)options.font_scale / 100.0f;
-  stbtt_GetFontVMetrics(font_info, &ascent, &descent, &line_gap);
-
-  paint_ascent = (int)(fabsf(ascent * paint_scale) + 0.5f);
-  paint_descent = (int)(fabsf(descent * paint_scale) + 0.5f);
+  ff6_font_metrics metrics = ff6_measure_font(
+      font_info, paint_size, options.font_scale, TEXT_IMG_H);
+  paint_scale = metrics.scale;
+  paint_ascent = metrics.ascent;
+  paint_descent = metrics.descent;
 }
 
 void setTextColor(int argb) {
@@ -400,20 +393,10 @@ static void rasterize_text(void) {
     int advance, left_bearing;
     stbtt_GetCodepointHMetrics(font_info, codepoint, &advance, &left_bearing);
 
-    int x0, y0, x1, y1;
-    stbtt_GetCodepointBitmapBox(font_info, codepoint, paint_scale, paint_scale,
-                                &x0, &y0, &x1, &y1);
-
-    int glyph_x = (int)(pen_x + 0.5f) + x0;
-    int glyph_y = paint_ascent + y0;
-
-    if (glyph_x >= 0 && glyph_y >= 0 && glyph_x + (x1 - x0) <= TEXT_IMG_W &&
-        glyph_y + (y1 - y0) <= height) {
-      stbtt_MakeCodepointBitmap(font_info,
-                                coverage + glyph_y * TEXT_IMG_W + glyph_x,
-                                x1 - x0, y1 - y0, TEXT_IMG_W, paint_scale,
-                                paint_scale, codepoint);
-    }
+    if (!ff6_raster_glyph(font_info, codepoint, paint_scale,
+                          (int)floorf(pen_x + 0.5f), paint_ascent, coverage,
+                          TEXT_IMG_W, height, TEXT_IMG_W))
+      trace("[font] unable to rasterize U+%04x\n", codepoint);
 
     pen_x += advance * paint_scale;
   }
@@ -487,7 +470,7 @@ jni_intarray *getTextImg(void) {
       int nonzero = 0;
       for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++)
-          if (text_image.elements[y * TEXT_IMG_W + x])
+          if ((unsigned int)text_image.elements[y * TEXT_IMG_W + x] >> 24)
             nonzero++;
       trace("[seq] getTextImg '%.24s' w=%d h=%d nonzero=%d\n", paint_text, w, h,
             nonzero);
@@ -508,7 +491,7 @@ int debugTextRegionNonzero(void) {
   int nonzero = 0;
   for (int y = 0; y < 48; y++)
     for (int x = 0; x < 48; x++)
-      if (text_image.elements[y * TEXT_IMG_W + x])
+      if ((unsigned int)text_image.elements[y * TEXT_IMG_W + x] >> 24)
         nonzero++;
   return nonzero;
 }
@@ -659,7 +642,7 @@ void openInputDialog(int multiline) {
   if (ime_open)
     return;
 
-  if (init_ime_dialog("", ime_text) >= 0)
+  if (init_ime_dialog("", ime_text, ime_limit) >= 0)
     ime_open = 1;
 }
 
@@ -667,12 +650,9 @@ const char *getInputText(void) {
   if (ime_open) {
     char *result = get_ime_dialog_result();
     if (result) {
-      strncpy(ime_result, result, sizeof(ime_result) - 1);
-      ime_result[sizeof(ime_result) - 1] = '\0';
-      /* Honour the limit the game asked for; the IME dialog counts UTF-16
-       * units so we clamp bytes conservatively here. */
-      if (ime_limit > 0 && ime_limit < (int)sizeof(ime_result))
-        ime_result[ime_limit] = '\0';
+      /* Android and the Vita IME count UTF-16 units, not UTF-8 bytes. */
+      ff6_copy_utf8(ime_result, sizeof(ime_result), result,
+                    ime_limit > 0 ? (size_t)ime_limit : (size_t)-1);
       ime_open = 0;
     }
   }
@@ -686,8 +666,7 @@ void setInputText(const char *text) {
     return;
   }
 
-  strncpy(ime_text, text, sizeof(ime_text) - 1);
-  ime_text[sizeof(ime_text) - 1] = '\0';
+  ff6_copy_utf8(ime_text, sizeof(ime_text), text, (size_t)-1);
 }
 
 void setLimitInputText(int limit) { ime_limit = limit; }

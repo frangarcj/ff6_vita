@@ -1,5 +1,8 @@
 android/
-build/
+build*/
+release/
+__pycache__/
+*.py[cod]
 *.velf
 *.elf
 *.vpk

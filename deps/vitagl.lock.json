@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/Rinnegatamante/vitaGL",
+  "base_commit": "c707ff00d9a372f0ba7056b4a4b723f5a00ba880",
+  "patch": "deps/vitagl-ff6.patch",
+  "patch_sha256": "ab48d97944641cdf67d71e6c43484d1f9975ae228340e3e26eb65b95b421f1c8",
+  "feature_origins": [
+    {
+      "commit": "b6bf21263d7609d831e8ca2ef757c8e81073b638",
+      "change": "Optional FF6 diagnostic counters"
+    },
+    {
+      "commit": "fa6763d08e636cb2ef0d3fb7e4f19c626766d820",
+      "change": "vglInPlaceTexSubImage"
+    },
+    {
+      "commit": "87cabe6506c935ea885596fd836ae5ea86458eea",
+      "change": "Native GL_FIXED color arrays"
+    }
+  ],
+  "additional_fix": "Use a 64-bit printf conversion for the widened shader diagnostic mask.",
+  "make_options": {
+    "NO_DEBUG": 1,
+    "NO_SPLASHSCREEN": 1,
+    "SHARED_RENDERTARGETS": 1
+  },
+  "validated_compiler": "arm-vita-eabi-gcc 15.2.0",
+  "notes": "Feature origin commits are recorded from the developer's local repository; they need not be publicly reachable. The bundled patch applies to the upstream base. Absolute debug paths and archive metadata can affect binary hashes; this is a source recipe, not a claim of byte-for-byte reproducibility."
+}

@@ -26,9 +26,9 @@ typedef struct {
  *   img = getTextImg();
  *
  * On Android the backing store is a 1024x640 ARGB_8888 Bitmap, so the returned
- * int[] has a *fixed* row stride of TEXT_IMG_W pixels regardless of w. The .so
- * only consumes the alpha channel (it ORs in its own colour), so we only have
- * to get coverage right.
+ * int[] has a *fixed* row stride of TEXT_IMG_W pixels regardless of w. The
+ * port must supply both coverage and setTextColor RGB: the native renderer
+ * modulates the uploaded pixels and does not add a colour to black texels.
  * ------------------------------------------------------------------------- */
 
 #define TEXT_IMG_W 1024

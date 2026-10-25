@@ -74,11 +74,13 @@ extern "C" {
 #include "bridge.h"
 #include "config.h"
 #include "dialog.h"
+#include "file_compat.h"
 #include "main.h"
 #include "so_util.h"
 }
 
 #include "softfp_wrappers.hpp"
+#include "glyph_upload.h"
 
 /* FF6_DEBUG selects the black-screen-hunt instrumentation: GL call logging,
  * per-frame dumps, on-screen probes, the hang watchdog and the boot.log
@@ -169,7 +171,6 @@ static void loadOptions(void) {
  * ======================================================================== */
 
 static int ret0(void) { return 0; }
-static int ret1(void) { return 1; }
 static void *retNULL(void) { return NULL; }
 
 static const char *log_prio_name(int prio) {
@@ -310,52 +311,37 @@ static int clock_gettime_fake(int clk_id, struct timespec *ts) {
  * inside the module, translate at the only door they can leave through: our
  * own file shims. Everything then lands under the game's own data directory. */
 static const char *translate_path(const char *path, char *buf, size_t buflen) {
-  static const char sdcard[] = "/sdcard/";
-
-  if (!path || strncmp(path, sdcard, sizeof(sdcard) - 1) != 0)
-    return path;
-
-  snprintf(buf, buflen, DATA_PATH "/%s", path + sizeof(sdcard) - 1);
-  return buf;
+  return ff6_translate_path(path, DATA_PATH, buf, buflen);
 }
 
-#define BIONIC_O_CREAT 0x40
-#define BIONIC_O_EXCL 0x80
-#define BIONIC_O_TRUNC 0x200
-#define BIONIC_O_APPEND 0x400
-#define BIONIC_O_NONBLOCK 0x800
-
 static int translate_open_flags(int flags) {
-  int out = flags & O_ACCMODE;
-
-  if (flags & BIONIC_O_CREAT)
-    out |= O_CREAT;
-  if (flags & BIONIC_O_EXCL)
-    out |= O_EXCL;
-  if (flags & BIONIC_O_TRUNC)
-    out |= O_TRUNC;
-  if (flags & BIONIC_O_APPEND)
-    out |= O_APPEND;
-  if (flags & BIONIC_O_NONBLOCK)
-    out |= O_NONBLOCK;
-
-  return out;
+  return ff6_translate_open_flags(flags);
 }
 
 static int open_fake(const char *path, int flags, ...) {
-  va_list ap;
-  va_start(ap, flags);
-  int mode = va_arg(ap, int);
-  va_end(ap);
+  int mode = 0;
+  if (flags & BIONIC_O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = va_arg(ap, int);
+    va_end(ap);
+  }
 
   char buf[256];
-  return open(translate_path(path, buf, sizeof(buf)),
-              translate_open_flags(flags), mode);
+  path = translate_path(path, buf, sizeof(buf));
+  return path ? open(path, translate_open_flags(flags), mode) : -1;
 }
 
 static FILE *fopen_fake(const char *path, const char *mode) {
   char buf[256];
-  return fopen(translate_path(path, buf, sizeof(buf)), mode);
+  path = translate_path(path, buf, sizeof(buf));
+  return path ? fopen(path, mode) : NULL;
+}
+
+static int remove_fake(const char *path) {
+  char buf[256];
+  path = translate_path(path, buf, sizeof(buf));
+  return path ? remove(path) : -1;
 }
 
 static void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd,
@@ -1742,17 +1728,38 @@ static void ANativeWindow_setBuffersGeometry(void *window, int w, int h,
  * GL shims
  * ======================================================================== */
 
-/* Texture filtering is ours to decide, not the engine's. The Android build
- * asks for GL_LINEAR on the sprite atlases, which on a 960x544 panel smears
- * 16x16 pixel art into mush. With the bilinear option off we force GL_NEAREST
- * instead of merely passing the request through, so characters and tiles stay
- * crisp; with it on the old smoothed look is still available. */
-static GLint filter_override(GLenum pname, GLint param) {
+static ff6_glyph_textures glyph_textures;
+
+/* Preserve linear sampling for rasterized font coverage. Pixel-art textures
+ * still follow the user's nearest/linear setting. Native TextGlyphTexture::
+ * Draw resets both filters every draw (calls at 0x1e71fc/0x1e7210 in Android
+ * 2.1.6), so setting them once during upload would be overwritten here. */
+static GLint filter_override(GLenum target, GLenum pname, GLint param) {
   if (pname != GL_TEXTURE_MIN_FILTER && pname != GL_TEXTURE_MAG_FILTER)
     return param;
-  /* FILTER_UPSCALE samples exactly too -- its single filtered step happens
-   * later, when the offscreen world is put on screen. */
-  return options.bilinear == FILTER_LINEAR ? GL_LINEAR : GL_NEAREST;
+  if (options.bilinear == FILTER_LINEAR)
+    return GL_LINEAR;
+
+  if (target == GL_TEXTURE_2D &&
+      (glyph_textures.page[0] || glyph_textures.page[1])) {
+    GLint texture = 0;
+    /* Query the actual active unit: the loader's bind cache is instrumentation
+     * state and release bindings bypass it. In the pinned vitaGL this query
+     * reads CPU texture-unit state; it performs no GPU synchronization. */
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
+    if (ff6_is_glyph_texture(&glyph_textures, (GLuint)texture)) {
+#ifdef FF6_DEBUG
+      static int logged;
+      if (logged < 6) {
+        logged++;
+        trace("[font-filter] tex=%u %s=LINEAR\n", (unsigned)texture,
+              pname == GL_TEXTURE_MIN_FILTER ? "MIN" : "MAG");
+      }
+#endif
+      return GL_LINEAR;
+    }
+  }
+  return GL_NEAREST;
 }
 
 #ifdef FF6_DEBUG
@@ -1780,7 +1787,7 @@ static void glTexParameteriHook(GLenum target, GLenum pname, GLint param) {
 #ifdef FF6_DEBUG
   log_wrap(pname, param);
 #endif
-  glTexParameteri(target, pname, filter_override(pname, param));
+  glTexParameteri(target, pname, filter_override(target, pname, param));
 }
 
 static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
@@ -1789,7 +1796,7 @@ static SOFTFP_ABI void glTexParameterfHook(GLenum target, GLenum pname,
   log_wrap(pname, (GLint)param);
 #endif
   glTexParameterf(target, pname,
-                  (GLfloat)filter_override(pname, (GLint)param));
+                  (GLfloat)filter_override(target, pname, (GLint)param));
 }
 
 /* vitaGL has no fixed-function light model; the game only ever sets the global
@@ -1886,14 +1893,17 @@ static volatile unsigned last_shim_arg;
   } while (0)
 
 static int open_mark(const char *path, int flags, ...) {
-  va_list ap;
-  va_start(ap, flags);
-  int mode = va_arg(ap, int);
-  va_end(ap);
+  int mode = 0;
+  if (flags & BIONIC_O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = va_arg(ap, int);
+    va_end(ap);
+  }
 
   char buf[256];
   path = translate_path(path, buf, sizeof(buf));
-  int fd = open(path, translate_open_flags(flags), mode);
+  int fd = path ? open(path, translate_open_flags(flags), mode) : -1;
   if (path && (strstr(path, "RockDat") || strstr(path, ".sav"))) {
     static int logged;
     if (logged < 20) {
@@ -1908,7 +1918,7 @@ static FILE *fopen_mark(const char *path, const char *mode) {
   MARK("fopen");
   char buf[256];
   path = translate_path(path, buf, sizeof(buf));
-  FILE *f = fopen(path, mode);
+  FILE *f = path ? fopen(path, mode) : NULL;
   /* Writes are rare and they are the ones that matter: a save that reports
    * success while no file appears fails somewhere on this line. */
   int is_write = mode && (mode[0] == 'w' || mode[0] == 'a');
@@ -2377,7 +2387,7 @@ static void bind_texture_2d(GLuint texture) {
   glBindTexture(GL_TEXTURE_2D, texture);
 }
 
-static void glBindTextureHook(GLenum target, GLuint texture) {
+[[maybe_unused]] static void glBindTextureHook(GLenum target, GLuint texture) {
 #ifdef FF6_DEBUG
   /* Instrumentation's view of the game's intended binding. Must update even
    * when the bind is skipped below, and got lost in the skip-cache rewrite:
@@ -2405,9 +2415,12 @@ static void glBindTextureHook(GLenum target, GLuint texture) {
  * refers to. Either would make the skip eat a REAL bind and send every
  * following upload to the wrong texture. Invalidate on both. */
 static void glDeleteTexturesHook(GLsizei n, const GLuint *textures) {
-  for (GLsizei i = 0; i < n; i++)
+  for (GLsizei i = 0; i < n; i++) {
+    /* GL can reuse deleted names for pixel-art textures. */
+    ff6_forget_glyph_texture(&glyph_textures, textures[i]);
     if (textures[i] == bound_texture_2d)
       bound_texture_2d = 0xFFFFFFFFu;
+  }
   glDeleteTextures(n, textures);
 }
 
@@ -3669,7 +3682,7 @@ static so_default_dynlib default_dynlib[] = {
     {"raise", (uintptr_t)&raise},
     {"read", (uintptr_t)&read},
     {"realloc", (uintptr_t)&realloc},
-    {"remove", (uintptr_t)&remove},
+    {"remove", (uintptr_t)&remove_fake},
     {"setjmp", (uintptr_t)&setjmp},
     {"sin", WRAP((double (*)(double))sin)},
     {"sinf", WRAP(sinf)},
@@ -3861,47 +3874,44 @@ static int ReadSaveDataResultHook(void) {
   return 1;
 }
 
-/* Replacement for TextGlyphTexture::drawGlyph. The original never lands its
- * glTexSubImage2D on this port, so the glyph atlas stays empty and every
- * piece of text in the game -- starting with the SQUARE ENIX splash -- is
- * invisible. The routine is small and fully understood from the disassembly:
- * glyph slot == registration index, atlas rows are 1024/cell cells wide, the
- * page's GL texture handle lives at [this + page*4 + 4], and the source image
- * is the getTextImg() buffer with a 1024-pixel stride. Re-do it here. */
+/* Replacement for TextGlyphTexture::drawGlyph, bound to Android 2.1.6's
+ * reference libFF6.so. registGlyphCode stores deque.size() as GlyphInfo.slot
+ * at 0x1e692a and passes that same value here at 0x1e6972; it queries the text
+ * metrics immediately before getTextImg(). Thus idx is also the atlas slot
+ * for this registration path, without duplicating the game's STLPort layout.
+ * The cell/page fields below are at this+0x40005c/0x400064; the two GL handles
+ * are at this+4/this+8. drawGlyph (0x1e65f4) and Draw (0x1e6d04) both wrap the
+ * atlas row, including the capacity boundary admitted by the native cache.
+ * The bitmap source keeps its fixed TEXT_IMG_W stride. */
 static void drawGlyphHook(void *self, int idx, int *pixels) {
-  if (idx < 0 || !pixels)
+  if (!self || idx < 0 || !pixels)
     return;
 
   uint8_t *base = (uint8_t *)self + 0x400000;
   int cell = *(int *)(base + 0x5C);
   int page = *(int *)(base + 0x64);
+  if (page < 0 || page > 1)
+    return;
   GLuint handle = *(GLuint *)((uint8_t *)self + page * 4 + 4);
 
-  if (cell <= 0 || !handle)
+  if (!handle || handle == (GLuint)-1)
     return;
 
-  int per_row = 1024 / cell;
-  if (per_row <= 0)
+  ff6_register_glyph_texture(&glyph_textures, page, handle);
+
+  int text_width = getTextWidth();
+  int text_height = getTextHeight();
+  ff6_glyph_region region;
+  if (!ff6_make_glyph_region(idx, cell, text_width, text_height, &region))
     return;
 
-  int w = getTextWidth();
-  int h = getTextHeight();
-  if (w <= 0 || h <= 0)
-    return;
-  if (w > cell)
-    w = cell;
-  if (h > cell)
-    h = cell;
+  static uint32_t *buf;
+  static size_t capacity;
+  if (!ff6_pack_glyph((const uint32_t *)pixels, &region, &buf, &capacity))
+    fatal_error("Not enough memory for the text glyph upload buffer.");
 
-  static int buf[64 * 64];
-  if (w > 64 || h > 64)
-    return;
-
-  for (int y = 0; y < h; y++)
-    memcpy(&buf[y * w], &pixels[y * 1024], w * sizeof(int));
-
-  int xoff = (idx % per_row) * cell;
-  int yoff = (idx / per_row) * cell;
+  int w = region.width, h = region.height;
+  int xoff = region.x, yoff = region.y;
 
   bind_texture_2d(handle);
   glTexSubImage2D(GL_TEXTURE_2D, 0, xoff, yoff, w, h, GL_RGBA,
@@ -3917,6 +3927,7 @@ static void drawGlyphHook(void *self, int idx, int *pixels) {
 
   static int logged;
   if (logged < 12) {
+    int per_row = FF6_GLYPH_ATLAS_SIZE / cell;
     logged++;
     trace("[glyph] uploaded idx=%d %dx%d at (%d,%d) tex=%u page=%d cell=%d "
           "slots=%d\n",
@@ -3952,18 +3963,25 @@ static void drawGlyphHook(void *self, int idx, int *pixels) {
 #endif
 }
 
+static uintptr_t required_game_symbol(const char *name) {
+  uintptr_t symbol = so_symbol(&ff6_mod, name);
+  if (!symbol)
+    fatal_error("Unsupported libFF6.so: missing required symbol\n%s", name);
+  return symbol;
+}
+
 static void patch_game(void) {
-  ff6_saveMgrInstance = (void *(*)(void))so_symbol(
-      &ff6_mod, "_ZN19cMobileSaveLoadMngr11getInstanceEv");
-  ff6_getResultReadFromFile = (int (*)(void *, int))so_symbol(
-      &ff6_mod, "_ZN19cMobileSaveLoadMngr21getResultReadFromFileEi");
+  ff6_saveMgrInstance = (void *(*)(void))required_game_symbol(
+      "_ZN19cMobileSaveLoadMngr11getInstanceEv");
+  ff6_getResultReadFromFile = (int (*)(void *, int))required_game_symbol(
+      "_ZN19cMobileSaveLoadMngr21getResultReadFromFileEi");
   ff6_writeToFile = (void (*)(void *))so_symbol(
       &ff6_mod, "_ZN19cMobileSaveLoadMngr11writeToFileEv");
 
-  hook_addr(so_symbol(&ff6_mod, "ReadSaveDataResult"),
+  hook_addr(required_game_symbol("ReadSaveDataResult"),
             (uintptr_t)&ReadSaveDataResultHook);
 
-  hook_addr(so_symbol(&ff6_mod, "_ZN16TextGlyphTexture9drawGlyphEiPi"),
+  hook_addr(required_game_symbol("_ZN16TextGlyphTexture9drawGlyphEiPi"),
             (uintptr_t)&drawGlyphHook);
 
 
@@ -4299,6 +4317,38 @@ static int file_exists(const char *path) {
   return sceIoGetstat(path, &stat) >= 0;
 }
 
+/* The loader patches private layouts in one known engine build. Refuse a
+ * different or damaged library before even reading its ELF table offsets. */
+static void validate_game_library(void) {
+  FILE *file = fopen(SO_PATH, "rb");
+  if (!file)
+    fatal_error("Error could not read %s.", SO_PATH);
+
+  int seek_result = fseek(file, 0, SEEK_END);
+  long size = ftell(file);
+  if (seek_result != 0 || size != FF6_SO_SIZE ||
+      fseek(file, 0, SEEK_SET) != 0) {
+    fclose(file);
+    fatal_error("Unsupported or damaged libFF6.so.\nUse the ARMv7 library from "
+                "Final Fantasy VI Android " FF6_ANDROID_VERSION ".");
+  }
+
+  unsigned char buffer[16384];
+  uLong checksum = crc32(0L, Z_NULL, 0);
+  size_t bytes;
+  size_t total = 0;
+  while ((bytes = fread(buffer, 1, sizeof(buffer), file)) != 0) {
+    checksum = crc32(checksum, buffer, (uInt)bytes);
+    total += bytes;
+  }
+  int failed = ferror(file);
+  fclose(file);
+  if (failed || total != FF6_SO_SIZE || checksum != FF6_SO_CRC32)
+    fatal_error("Unsupported or damaged libFF6.so.\nUse the ARMv7 library from "
+                "Final Fantasy VI Android " FF6_ANDROID_VERSION ".\n"
+                "See the README for the supported file checksum.");
+}
+
 int main(int argc, char *argv[]) {
   SceAppUtilInitParam initParam{};
   SceAppUtilBootParam bootParam{};
@@ -4328,6 +4378,8 @@ int main(int argc, char *argv[]) {
   if (!file_exists(OBB_PATH))
     fatal_error("Error could not find %s.", OBB_PATH);
 
+  validate_game_library();
+
   InitJNIEnv();
   InitJavaVM();
   find_exidx_bounds(SO_PATH);
@@ -4344,7 +4396,8 @@ int main(int argc, char *argv[]) {
   trace("[ff6] so_relocate...\n");
   so_relocate(&ff6_mod);
   trace("[ff6] so_resolve...\n");
-  so_resolve(&ff6_mod, default_dynlib, sizeof(default_dynlib), 0);
+  if (so_resolve(&ff6_mod, default_dynlib, sizeof(default_dynlib), 0) < 0)
+    fatal_error("Unsupported libFF6.so: required imports could not be resolved.");
   trace("[ff6] patch_game...\n");
   patch_game();
   so_flush_caches(&ff6_mod);

@@ -322,6 +322,7 @@ uintptr_t so_resolve_link(so_module *mod, const char *symbol) {
 }
 
 int so_resolve(so_module *mod, const so_default_dynlib *default_dynlib, int size_default_dynlib, int default_dynlib_only) {
+  int missing = 0;
   for (int i = 0; i < mod->num_reldyn + mod->num_relplt; i++) {
     Elf32_Rel *rel = i < mod->num_reldyn ? &mod->reldyn[i] : &mod->relplt[i - mod->num_reldyn];
     Elf32_Sym *sym = &mod->dynsym[ELF32_R_SYM(rel->r_info)];
@@ -358,7 +359,12 @@ int so_resolve(so_module *mod, const so_default_dynlib *default_dynlib, int size
           }
 
           if (!resolved) {
-            // debugPrintf("Missing: %s\n", mod->dynstr + sym->st_name);
+            if (ELF32_ST_BIND(sym->st_info) == STB_WEAK) {
+              *ptr = 0;
+            } else {
+              trace("[so] missing required import: %s\n", mod->dynstr + sym->st_name);
+              missing++;
+            }
           }
         }
 
@@ -370,7 +376,7 @@ int so_resolve(so_module *mod, const so_default_dynlib *default_dynlib, int size
     }
   }
 
-  return 0;
+  return missing ? -1 : 0;
 }
 
 void so_initialize(so_module *mod) {

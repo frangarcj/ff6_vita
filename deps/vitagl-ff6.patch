@@ -1,0 +1,312 @@
+diff --git a/source/ffp.c b/source/ffp.c
+index 11937c4..cffc876 100644
+--- a/source/ffp.c
++++ b/source/ffp.c
+@@ -281,6 +281,7 @@ static GLenum ffp_mode;
+ uint16_t ffp_vertex_attrib_state = 0;
+ uint8_t ffp_vertex_attrib_fixed_mask = 0;
+ uint8_t ffp_vertex_attrib_fixed_pos_mask = 0;
++uint8_t ffp_vertex_attrib_fixed_color = 0;
+ 
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+ typedef union {
+@@ -302,36 +303,39 @@ typedef union {
+ 		uint64_t fast_perspective_correction : 1; // Frag/Vert
+ 		uint64_t srgb_mode : 1; // Frag
+ 		uint64_t lighting : 1; // Frag/Vert
+-		uint64_t UNUSED : 28;
++		uint64_t fixed_color : 1; // Vert
++		uint64_t UNUSED : 27;
+ 	};
+ 	uint64_t raw;
+ } shader_mask;
+-#define VERTEX_SHADER_MASK   (0b0000000000000000000000000000101011111100011000000111111100111000)
++#define VERTEX_SHADER_MASK   (0b0000000000000000000000000001101011111100011000000111111100111000)
+ #define FRAGMENT_SHADER_MASK (0b0000000000000000000000000000111100000011101111111111100011111111)
+ #else
+ typedef union {
+ 	struct {
+-		uint32_t alpha_test_mode : 3; // Frag
+-		uint32_t num_textures : 2; // Frag/Vert
+-		uint32_t has_colors : 1; // Frag/Vert
+-		uint32_t fog_mode : 2; // Frag
+-		uint32_t clip_planes_num : 3; // Vert
+-		uint32_t lights_num : 4; // Frag/Vert
+-		uint32_t tex_env_mode_pass0 : 3; // Frag
+-		uint32_t tex_env_mode_pass1 : 3; // Frag
+-		uint32_t shading_mode : 1; // Frag/Vert
+-		uint32_t normalize : 1; // Vert
+-		uint32_t fixed_mask : 3; // Vert
+-		uint32_t pos_fixed_mask : 2; // Vert
+-		uint32_t point_sprite : 1; // Frag
+-		uint32_t fast_perspective_correction : 1; // Frag/Vert
+-		uint32_t srgb_mode : 1; // Frag
+-		uint32_t lighting : 1; // Frag/Vert
++		uint64_t alpha_test_mode : 3; // Frag
++		uint64_t num_textures : 2; // Frag/Vert
++		uint64_t has_colors : 1; // Frag/Vert
++		uint64_t fog_mode : 2; // Frag
++		uint64_t clip_planes_num : 3; // Vert
++		uint64_t lights_num : 4; // Frag/Vert
++		uint64_t tex_env_mode_pass0 : 3; // Frag
++		uint64_t tex_env_mode_pass1 : 3; // Frag
++		uint64_t shading_mode : 1; // Frag/Vert
++		uint64_t normalize : 1; // Vert
++		uint64_t fixed_mask : 3; // Vert
++		uint64_t pos_fixed_mask : 2; // Vert
++		uint64_t point_sprite : 1; // Frag
++		uint64_t fast_perspective_correction : 1; // Frag/Vert
++		uint64_t srgb_mode : 1; // Frag
++		uint64_t lighting : 1; // Frag/Vert
++		uint64_t fixed_color : 1; // Vert
++		uint64_t UNUSED : 31;
+ 	};
+-	uint32_t raw;
++	uint64_t raw;
+ } shader_mask;
+-#define VERTEX_SHADER_MASK   (0b10101111111000000111111100111000)
+-#define FRAGMENT_SHADER_MASK (0b11110000001111111111100011111111)
++#define VERTEX_SHADER_MASK   (0b110101111111000000111111100111000ULL)
++#define FRAGMENT_SHADER_MASK (0b011110000001111111111100011111111ULL)
+ #endif
+ #ifndef DISABLE_TEXTURE_COMBINER
+ typedef union {
+@@ -399,7 +403,7 @@ uint16_t ffp_dirty_vert_attr = 0xFFFF;
+ uint16_t dirty_vert_unifs = 0xFFFF;
+ uint32_t dirty_frag_unifs = 0xFFFFFFFF;
+ blend_config ffp_blend_info;
+-shader_mask ffp_mask = {.raw = 0xFFFFFFFF};
++shader_mask ffp_mask = {.raw = ~0ULL};
+ GLenum color_material_mode = GL_AMBIENT_AND_DIFFUSE;
+ GLboolean color_material_state = GL_FALSE;
+ #ifndef DISABLE_TEXTURE_COMBINER
+@@ -568,6 +572,8 @@ void setup_combiner_pass(int i, char *dst) {
+ }
+ #endif
+ 
++extern uint32_t vgl_debug_log_draws;
++
+ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *streams, SceGxmIndexSource index_type) {
+ #ifdef HAVE_PROFILING
+ 	uint32_t reload_ffp_shaders_start = sceKernelGetProcessTimeLow();
+@@ -611,6 +617,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 	mask.normalize = normalize;
+ 	mask.fixed_mask = ffp_vertex_attrib_fixed_mask;
+ 	mask.pos_fixed_mask = ffp_vertex_attrib_fixed_pos_mask;
++	mask.fixed_color = (ffp_vertex_attrib_fixed_color && mask.has_colors) ? 1 : 0;
+ 	mask.fast_perspective_correction = fast_perspective_correction_hint;
+ 	mask.srgb_mode = srgb_mode;
+ 	mask.lighting = lighting_state;
+@@ -734,7 +741,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 	uint64_t vert_shader_mask = mask.raw & VERTEX_SHADER_MASK;
+ 	uint64_t frag_shader_mask = mask.raw & FRAGMENT_SHADER_MASK;
+ #else
+-	uint32_t vert_shader_mask = mask.raw & VERTEX_SHADER_MASK;
++	uint64_t vert_shader_mask = mask.raw & VERTEX_SHADER_MASK; // fixed_color lives in bit 32
+ 	uint32_t frag_shader_mask = mask.raw & FRAGMENT_SHADER_MASK;
+ #endif
+ 	
+@@ -815,7 +822,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ #ifdef HAVE_HIGH_FFP_TEXUNITS
+ 		sprintf(fname, "ux0:data/shader_cache/v%d/v/%016llX-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
+ #else
+-		sprintf(fname, "ux0:data/shader_cache/v%d/v/%08X-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
++		sprintf(fname, "ux0:data/shader_cache/v%d/v/%09llX-%d.gxp", FFP_SHADER_CACHE_MAGIC, vert_shader_mask, WVP_ON_GPU);
+ #endif
+ 		SceUID f = sceIoOpen(fname, SCE_O_RDONLY, 0777);
+ 		if (f >= 0) {
+@@ -832,7 +839,7 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ 
+ 			// Compiling the new shader
+ 			char vshader[8192];
+-			sprintf(vshader, ffp_vert_src, mask.clip_planes_num, mask.num_textures, mask.has_colors, mask.lights_num, mask.lighting, mask.shading_mode, mask.normalize, mask.fixed_mask, mask.pos_fixed_mask, WVP_ON_GPU, mask.fast_perspective_correction);
++			sprintf(vshader, ffp_vert_src, mask.clip_planes_num, mask.num_textures, mask.has_colors, mask.lights_num, mask.lighting, mask.shading_mode, mask.normalize, mask.fixed_mask, mask.pos_fixed_mask, mask.fixed_color, WVP_ON_GPU, mask.fast_perspective_correction);
+ 			uint32_t size = strlen(vshader);
+ 			SceGxmProgram *t = shark_compile_shader_extended(vshader, &size, SHARK_VERTEX_SHADER, compiler_opts, compiler_fastmath, compiler_fastprecision, compiler_fastint);
+ 			ffp_vertex_program = (SceGxmProgram *)vglMalloc(size);
+@@ -1322,6 +1329,18 @@ uint8_t reload_ffp_shaders(SceGxmVertexAttribute *attrs, SceGxmVertexStream *str
+ #ifdef HAVE_PROFILING
+ 	ffp_reload_profiler_cnt += sceKernelGetProcessTimeLow() - reload_ffp_shaders_start;
+ #endif
++
++	// DEBUG (vgl_debug_log_draws): per-draw record of what actually reaches
++	// sceGxm -- shader variant mask, sampled texture data pointer and the
++	// viewport mapping in force -- so a visible and an invisible draw can be
++	// diffed at this level.
++	if (vgl_debug_log_draws) {
++		int dtid = texture_units[0].tex_id[texture_units[0].state > 1 ? 0 : 1];
++		texture *dtex = &texture_slots[dtid];
++		sceClibPrintf("[vgl] draw mask=0x%016llx texid=%d texdata=%p texstat=%d vp=(%.1f,%.1f,%.1f,%.1f z:%.3f+%.3f)\n",
++			(unsigned long long)mask.raw, dtid, dtex->status ? sceGxmTextureGetData(&dtex->gxm_tex) : NULL,
++			dtex->status, x_port, x_scale, y_port, y_scale, z_port, z_scale);
++	}
+ 	return draw_mask_state;
+ }
+ 
+@@ -1937,25 +1956,38 @@ void glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *point
+ 	unsigned short bpe;
+ 	switch (type) {
+ 	case GL_FLOAT:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
+ 		bpe = 4;
+ 		break;
+ 	case GL_SHORT:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_S16N;
+ 		bpe = 2;
+ 		break;
+ 	case GL_UNSIGNED_SHORT:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_U16N;
+ 		bpe = 2;
+ 		break;
+ 	case GL_BYTE:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_S8N;
+ 		bpe = 1;
+ 		break;
+ 	case GL_UNSIGNED_BYTE:
++		ffp_vertex_attrib_fixed_color = 0;
+ 		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_U8N;
+ 		bpe = 1;
+ 		break;
++	case GL_FIXED:
++		// No fixed point vertex format on the GPU: declare F32 and let the
++		// generated vertex shader unpack the raw 16.16 words, same trick as
++		// positions/texcoords. Needs size == 4 (which GLES1 mandates anyway).
++		ffp_vertex_attrib_fixed_color = 1;
++		attributes->format = SCE_GXM_ATTRIBUTE_FORMAT_F32;
++		bpe = 4;
++		break;
+ 	default:
+ 		SET_GL_ERROR_WITH_VALUE(GL_INVALID_ENUM, type)
+ 	}
+diff --git a/source/gxm.c b/source/gxm.c
+index ffa0279..c78ceb6 100644
+--- a/source/gxm.c
++++ b/source/gxm.c
+@@ -67,6 +67,8 @@ GLboolean dirty_query = GL_FALSE; // Flag whether occlusion queries needs result
+ static GLboolean needs_end_scene = GL_FALSE; // Flag for gxm end scene requirement at scene reset
+ static GLboolean needs_scene_reset = GL_TRUE; // Flag for when a scene reset is required
+ static GLboolean scene_not_flushed = GL_FALSE; // Flag for when a scene had been forcibly flushed as last operation
++uint32_t vgl_debug_scene_splits = 0; // DEBUG: mid-frame scene splits (scene_end called from scene_reset)
++uint32_t vgl_debug_log_draws = 0; // DEBUG: per-draw ffp logging switch
+ 
+ SceGxmContext *gxm_context; // sceGxm context instance
+ GLenum vgl_error = GL_NO_ERROR; // Error returned by glGetError
+@@ -590,6 +592,7 @@ void scene_reset(void) {
+ 
+ 		// Ending drawing scene
+ 		if (needs_end_scene) {
++			vgl_debug_scene_splits++;
+ 			scene_end();
+ 		} else {
+ 			if (legacy_pool_size) {
+diff --git a/source/shaders/ffp_ext_v.h b/source/shaders/ffp_ext_v.h
+index b7ce3bf..1a07fc4 100644
+--- a/source/shaders/ffp_ext_v.h
++++ b/source/shaders/ffp_ext_v.h
+@@ -16,6 +16,7 @@ R"(#define clip_planes_num %d
+ #define normalization %d
+ #define fixed_mode_mask %d
+ #define fixed_mode_pos %d
++#define fixed_mode_color %d
+ #define calculate_wvp %d
+ #define interp %d
+ 
+@@ -157,6 +158,11 @@ void main(
+ #if fixed_mode_pos == 3
+ 	Nposition = GLFixed4ToFloat4(Nposition);
+ #endif
++#if fixed_mode_color == 1 && (has_colors == 1 || lights_num > 0)
++	// GL_FIXED colour arrays arrive as raw 16.16 words in a F32 attribute
++	// (like positions/texcoords above); requires 4 components per colour.
++	color = GLFixed4ToFloat4(color);
++#endif
+ #if calculate_wvp == 1
+ 	Jwvp = mul(Jwvp, Imodelview); // Jwvp is actually the proj matrix
+ #endif
+diff --git a/source/shaders/ffp_v.h b/source/shaders/ffp_v.h
+index 888cab4..2ecbd67 100644
+--- a/source/shaders/ffp_v.h
++++ b/source/shaders/ffp_v.h
+@@ -15,6 +15,7 @@ R"(#define clip_planes_num %d
+ #define normalization %d
+ #define fixed_mode_mask %d
+ #define fixed_mode_pos %d
++#define fixed_mode_color %d
+ #define calculate_wvp %d
+ #define interp %d
+ 
+@@ -149,6 +150,11 @@ void main(
+ #if fixed_mode_pos == 3
+ 	Nposition = GLFixed4ToFloat4(Nposition);
+ #endif
++#if fixed_mode_color == 1 && (has_colors == 1 || lights_num > 0)
++	// GL_FIXED colour arrays arrive as raw 16.16 words in a F32 attribute
++	// (like positions/texcoords above); requires 4 components per colour.
++	color = GLFixed4ToFloat4(color);
++#endif
+ #if calculate_wvp == 1
+ 	Jwvp = mul(Jwvp, Imodelview); // Jwvp is actually the proj matrix
+ #endif
+diff --git a/source/shared.h b/source/shared.h
+index dbdf64b..c9183e7 100644
+--- a/source/shared.h
++++ b/source/shared.h
+@@ -878,6 +878,7 @@ extern int garbage_collector(unsigned int args, void *arg); // Garbage collector
+ #endif
+ extern SceUID gc_mutex[2]; // Garbage collector mutex
+ extern GLboolean has_cached_mem; // Flag for whether to use cached memory for mempools or not
++extern GLboolean vgl_inplace_texsub; // Flag for whether glTexSubImage2D writes texture storage in place (no orphan copy)
+ extern uint8_t gxm_display_buffer_count; // Display buffers count
+ 
+ extern int legacy_pool_size; // Mempool size for GL1 immediate draw pipeline
+diff --git a/source/textures.c b/source/textures.c
+index 7b5d704..7c74d7f 100644
+--- a/source/textures.c
++++ b/source/textures.c
+@@ -982,7 +982,7 @@ static inline __attribute__((always_inline)) void _glTexSubImage2D(texture *tex,
+ 
+ #ifndef TEXTURES_SPEEDHACK
+ 	// Copying the texture in a new mem location and dirtying old one
+-	if (tex->last_frame != OBJ_NOT_USED && (vgl_framecount - tex->last_frame <= FRAME_PURGE_FREQ)) {
++	if (!vgl_inplace_texsub && tex->last_frame != OBJ_NOT_USED && (vgl_framecount - tex->last_frame <= FRAME_PURGE_FREQ)) {
+ 		uint32_t size;
+ 		if (tex->mip_count > 1) {
+ 			po2_w = nearest_po2(orig_w);
+diff --git a/source/vgl.c b/source/vgl.c
+index 01f58ce..4bc2fba 100644
+--- a/source/vgl.c
++++ b/source/vgl.c
+@@ -777,6 +777,11 @@ void vglUseCachedMem(GLboolean use) {
+ 	has_cached_mem = use;
+ }
+ 
++GLboolean vgl_inplace_texsub = GL_FALSE;
++void vglInPlaceTexSubImage(GLboolean enable) {
++	vgl_inplace_texsub = enable;
++}
++
+ void vglSetTextureCacheFrequency(GLuint freq) {
+ #ifdef HAVE_TEX_CACHE
+ 	vgl_tex_cache_freq = freq;
+diff --git a/source/vitaGL.h b/source/vitaGL.h
+index dac9fa0..a957025 100644
+--- a/source/vitaGL.h
++++ b/source/vitaGL.h
+@@ -1304,6 +1304,13 @@ void vglTexImageDepthBuffer(GLenum target);
+ // Makes vitaGL use cached memory instead of uncached memory for its internal memory pools. Must be called before vglInit*.
+ void vglUseCachedMem(GLboolean use);
+ 
++// Makes glTexSubImage2D write the texture storage in place instead of orphaning it
++// (allocating a fresh surface and copying the WHOLE texture over) when the texture
++// was drawn in the last few frames. Big win for apps that stream sub-rects into
++// large textures every frame; the caller accepts that the GPU may sample a mix of
++// old and new texels for a frame.
++void vglInPlaceTexSubImage(GLboolean enable);
++
+ // Makes the GLSL translator use low precision variables (eg: float -> half).
+ void vglUseLowPrecision(GLboolean val);
+ 
