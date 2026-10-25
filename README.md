@@ -177,7 +177,7 @@ for its action mapping.
 
 ### Configurator
 
-Open **Configure** in the game's LiveArea to launch the bundled companion.
+Open **Configuration** in the game's LiveArea to launch the bundled companion.
 It works without the commercial game files. Navigate with the gamepad, choose
 **Save and launch** (or press **START**) to apply options and start the game.
 Save/exit and discard actions are also available. A failed save is reported
@@ -382,9 +382,13 @@ The swap regression covers both profiles: neither may inject diagnostic waits,
 pixel-readback probes or overlay draws into frame presentation.
 
 The public release checker requires the Configurator, all seven shader pairs,
-license notices and LiveArea resources. Original indexed PNG assets can be
-regenerated with `python3 tools/generate_livearea.py`; no commercial artwork
-is needed for that build step.
+license notices and the complete **Standard-Republic LiveArea artwork**,
+including `pic0.png`. The supplied a3 layout retains its Configuration button,
+linked to `psla:-config`. The startup image is adapted to indexed PNG8 with
+transparency; the other supplied images retain their original bytes and sizes.
+See [the artwork integration notes](docs/LIVEAREA_ASSETS.md) for provenance.
+The old geometric-art generator now writes only to a separate fallback
+directory and cannot overwrite the packaged artwork.
 
 ### Tests and workflows
 
@@ -400,8 +404,12 @@ provenance bundle. Public CI uses `--require-clean-source` so an unknown Git
 revision or dirty checkout cannot silently produce a release bundle.
 `Release` builds version tags, verifies the bundle's commit
 and checksums, and publishes with `gh`. Tags ending in `-rcN` are prereleases,
-not the latest stable release. Existing releases/assets are never overwritten
-by the workflow; fixes require a new version tag. Actions are pinned by commit.
+not the latest stable release. Automatic tag runs never overwrite existing
+releases. An explicitly authorized RC repack can use the manual
+`replace_existing` input after preserving the previous bundle and updating the
+tag to the tested commit. Stable/immutable releases cannot use that override.
+The workflow verifies the release identity, tag, checksums and downloaded assets.
+Actions are pinned by commit.
 
 ## Credits
 
@@ -409,6 +417,7 @@ by the workflow; fixes require a new version tag. Actions are pinned by commit.
 - Rinnegatamante for vitaGL and fixes.
 - The `ff3_vita` contributors for the Configurator pattern and PostFX sources.
 - Omar Cornut and the Vita ImGui port contributors for the configuration UI.
+- **Standard-Republic**, thank you for providing the LiveArea assets and layout.
 
 See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
 the project license and bundled third-party notices, including the Noto fonts.

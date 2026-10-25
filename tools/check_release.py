@@ -17,7 +17,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 
 
 FONTS = (
@@ -26,13 +28,15 @@ FONTS = (
     "NotoSansSC-Regular.ttf",
 )
 NOTICES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/OFL-Noto.txt", "licenses/MIT-ImGui.txt")
-ARTWORK = (
-    "sce_sys/icon0.png",
-    "sce_sys/livearea/contents/bg0.png",
-    "sce_sys/livearea/contents/startup.png",
-    "sce_sys/livearea/contents/config.png",
-    "sce_sys/livearea/contents/template.xml",
-)
+ARTWORK_DIMENSIONS = {
+    "sce_sys/icon0.png": (128, 128),
+    "sce_sys/pic0.png": (960, 544),
+    "sce_sys/livearea/contents/bg0.png": (840, 500),
+    "sce_sys/livearea/contents/frame4.png": (280, 158),
+    "sce_sys/livearea/contents/frame3.png": (128, 31),
+}
+LIVEAREA_TEMPLATE = "sce_sys/livearea/contents/template.xml"
+ARTWORK = (*ARTWORK_DIMENSIONS, LIVEAREA_TEMPLATE)
 SHADERS = tuple("shaders/" + name + suffix for name in (
     "1_Negative", "2_FXAA", "3_Sepia", "4_Greyscale", "5_CRT",
     "6_CRT-Bleeding", "7_CRT-Bleeding-Flat") for suffix in ("_v.cg", "_f.cg"))
@@ -55,6 +59,74 @@ DIAGNOSTIC_MARKERS = (
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def validate_livearea(resources):
+    """Check source or packaged bytes, including alpha and the Configurator link."""
+    for name, dimensions in ARTWORK_DIMENSIONS.items():
+        data = resources.get(name, b"")
+        require(33 <= len(data) <= 2 * 1024 * 1024 and
+                data[:8] == b"\x89PNG\r\n\x1a\n", "Invalid LiveArea PNG: " + name)
+        chunks, offset = [], 8
+        while offset < len(data):
+            require(offset + 12 <= len(data), "Truncated PNG chunk: " + name)
+            size = struct.unpack_from(">I", data, offset)[0]
+            kind = data[offset + 4:offset + 8]
+            end = offset + 8 + size
+            require(end + 4 <= len(data), "Truncated PNG data: " + name)
+            payload = data[offset + 8:end]
+            checksum = struct.unpack_from(">I", data, end)[0]
+            require(zlib.crc32(kind + payload) & 0xffffffff == checksum,
+                    "PNG CRC mismatch: " + name)
+            chunks.append((kind, payload))
+            offset = end + 4
+        require(chunks[0][0] == b"IHDR" and len(chunks[0][1]) == 13 and
+                chunks[-1] == (b"IEND", b""), "Invalid PNG structure: " + name)
+        header = struct.unpack(">IIBBBBB", chunks[0][1])
+        require(header[:2] == dimensions and header[2:] == (8, 3, 0, 0, 0),
+                "Wrong dimensions or non-indexed PNG8: " + name)
+        palettes = [value for kind, value in chunks if kind == b"PLTE"]
+        require(len(palettes) == 1 and 0 < len(palettes[0]) <= 768 and
+                len(palettes[0]) % 3 == 0, "Invalid PNG palette: " + name)
+        transparency = [value for kind, value in chunks if kind == b"tRNS"]
+        require(len(transparency) <= 1 and all(
+            len(value) <= len(palettes[0]) // 3 for value in transparency),
+            "Invalid palette transparency: " + name)
+        if name.endswith("/frame4.png"):
+            require(transparency and min(transparency[0]) == 0,
+                    "Startup image lost its transparent background")
+        compressed = b"".join(value for kind, value in chunks if kind == b"IDAT")
+        expected = (dimensions[0] + 1) * dimensions[1]
+        decoder = zlib.decompressobj()
+        try:
+            raw = decoder.decompress(compressed, expected + 1)
+        except zlib.error as error:
+            raise ValueError("Invalid PNG pixels: " + name) from error
+        require(len(raw) == expected and decoder.eof and not decoder.unused_data and
+                all(raw[row * (dimensions[0] + 1)] <= 4 for row in range(dimensions[1])),
+                "Invalid PNG pixel extent or filters: " + name)
+    try:
+        root = ET.fromstring(resources.get(LIVEAREA_TEMPLATE, b""))
+    except ET.ParseError as error:
+        raise ValueError("Invalid LiveArea template XML") from error
+    require(root.tag == "livearea" and root.get("style") == "a3" and
+            root.get("format-ver") == "01.00" and root.get("content-rev") == "2",
+            "Unexpected LiveArea layout or content revision")
+    targets = [node.text for node in root.iter("target")]
+    require(targets == ["psla:-config"], "LiveArea must launch the Configurator, not a placeholder")
+    expected_refs = {"bg0.png", "frame3.png", "frame4.png"}
+    references = {node.text for node in root.iter()
+                  if node.tag in ("image", "startup-image", "background")}
+    require(references == expected_refs, "Unexpected or missing LiveArea image reference")
+    require(root.findtext("./livearea-background/image") == "bg0.png" and
+            root.findtext("./gate/startup-image") == "frame4.png",
+            "Incorrect LiveArea background or gate")
+    button = root.find("./frame[@id='frame3']/liveitem/image")
+    require(button is not None and button.text == "frame3.png" and
+            all(button.get(key) == value for key, value in {
+                "width": "128", "height": "31", "x": "-66", "y": "-90",
+                "origin": "frame", "align": "center", "valign": "center"}.items()),
+            "Configuration button does not match the supplied a3 layout")
 
 
 def sha256(path):
@@ -242,6 +314,7 @@ def validate(build):
         require(REQUIRED.issubset(names),
                 "Missing VPK files: " + ", ".join(sorted(REQUIRED - set(names))))
         require(archive.testzip() is None, "VPK CRC check failed")
+        validate_livearea({name: archive.read(name) for name in ARTWORK})
         sfo = read_sfo(archive.read("sce_sys/param.sfo"))
         require(sfo.get("TITLE_ID") == "FF6000000", "Incorrect VPK TITLE_ID")
         require(sfo.get("TITLE") == "Final Fantasy VI", "Incorrect VPK title")

@@ -9,6 +9,11 @@ on:
         description: Existing version tag (for example v1.0.0-rc1)
         required: true
         type: string
+      replace_existing:
+        description: Explicitly replace the existing RC assets (maintainer-authorized repack only)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -22,11 +27,16 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.check.outputs.tag }}
+      publish: ${{ steps.check.outputs.publish }}
+      release_id: ${{ steps.check.outputs.release_id }}
     steps:
       - name: Validate release tag
         id: check
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REPLACE: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_existing && 'true' || 'false' }}
         shell: bash
         run: |
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
@@ -34,9 +44,36 @@ jobs:
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if gh api "repos/$GH_REPO/releases/tags/$TAG" > release.json 2> release.err; then
+            if [[ "$REPLACE" != true ]]; then
+              echo "Release already exists; leaving published assets unchanged."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$TAG" != *-rc* ]]; then
+              echo "Only an explicitly authorized RC repack may replace assets." >&2
+              exit 1
+            fi
+            python3 - <<'PY'
+          import json, os
+          r = json.load(open('release.json'))
+          assert r['prerelease'] and not r['draft'] and not r.get('immutable', False)
+          assert r['tag_name'] == os.environ['TAG']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print(f"release_id={r['id']}", file=out)
+          PY
+          elif ! grep -q 'HTTP 404' release.err; then
+            cat release.err >&2
+            exit 1
+          elif [[ "$REPLACE" == true ]]; then
+            echo "Requested replacement but this release does not exist." >&2
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: identity
+    if: needs.identity.outputs.publish == 'true'
     uses: ./.github/workflows/compilation.yml
     with:
       ref: ${{ needs.identity.outputs.tag }}
@@ -45,6 +82,7 @@ jobs:
 
   publish:
     needs: [identity, build]
+    if: needs.identity.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -71,27 +109,51 @@ jobs:
           assert manifest['source_dirty'] is False
           assert manifest['ff6_debug'] is False
           PY
-      - name: Publish using GitHub CLI (never replace existing releases)
+      - name: Publish using GitHub CLI (replacement requires manual authorization)
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.identity.outputs.tag }}
+          REPLACE: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_existing && 'true' || 'false' }}
+          RELEASE_ID: ${{ needs.identity.outputs.release_id }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          commit="$(git rev-parse HEAD)"
+          remote_commit="$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)"
+          test "$remote_commit" = "$commit"
+          files=(release_bundle/FF6.vpk release_bundle/FF6.elf
+                 release_bundle/companion.elf release_bundle/manifest.json
+                 release_bundle/SHA256SUMS)
+          if [[ "$REPLACE" == true ]]; then
+            gh api "repos/$GH_REPO/releases/tags/$TAG" > current-release.json
+            python3 - <<'PY'
+          import json, os
+          r = json.load(open('current-release.json'))
+          assert str(r['id']) == os.environ['RELEASE_ID']
+          assert r['prerelease'] and not r['draft'] and not r.get('immutable', False)
+          assert r['tag_name'] == os.environ['TAG']
+          PY
+            test -f "docs/releases/$TAG.md"
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes-file "docs/releases/$TAG.md" \
+              --target "$commit" --prerelease --latest=false
+          elif gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release already exists; refusing to overwrite published assets." >&2
             exit 1
-          fi
-          args=(--verify-tag --title "Final Fantasy VI Vita $TAG")
-          if [[ "$TAG" == *-rc* ]]; then
-            args+=(--prerelease --latest=false)
-          fi
-          if [[ -f "docs/releases/$TAG.md" ]]; then
-            args+=(--notes-file "docs/releases/$TAG.md")
           else
-            args+=(--generate-notes)
+            args=(--verify-tag --title "Final Fantasy VI Vita $TAG")
+            if [[ "$TAG" == *-rc* ]]; then
+              args+=(--prerelease --latest=false)
+            fi
+            if [[ -f "docs/releases/$TAG.md" ]]; then
+              args+=(--notes-file "docs/releases/$TAG.md")
+            else
+              args+=(--generate-notes)
+            fi
+            gh release create "$TAG" "${args[@]}" "${files[@]}"
           fi
-          gh release create "$TAG" "${args[@]}" \
-            release_bundle/FF6.vpk release_bundle/FF6.elf \
-            release_bundle/companion.elf release_bundle/manifest.json \
-            release_bundle/SHA256SUMS
+          gh release download "$TAG" --dir published-check
+          (cd published-check && sha256sum -c SHA256SUMS)
+          for file in "${files[@]}"; do
+            cmp "$file" "published-check/$(basename "$file")"
+          done

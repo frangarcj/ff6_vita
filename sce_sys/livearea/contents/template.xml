@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
-<livearea style="a5" format-ver="01.00" content-rev="1">
-  <livearea-background><image>bg0.png</image></livearea-background>
-  <gate><startup-image>startup.png</startup-image></gate>
-  <frame id="frame6">
-    <liveitem>
+<livearea style="a3" format-ver="01.00" content-rev="2">
+  <livearea-background>
+    <image>bg0.png</image>
+  </livearea-background>
+  <gate>
+    <startup-image>frame4.png</startup-image>
+  </gate>
+  <frame id="frame3" multi="o" autoflip="0" rev="1">
+    <liveitem default="on">
+      <image align="center" valign="center" origin="frame" width="128" height="31" x="-66" y="-90">frame3.png</image>
       <target>psla:-config</target>
-      <background valign="bottom" align="center">config.png</background>
     </liveitem>
   </frame>
 </livearea>

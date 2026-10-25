@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regenerate original, game-asset-free indexed PNGs using only Python's stdlib."""
+"""Generate historical fallback art outside the packaged Standard-Republic assets."""
+import argparse
 from pathlib import Path
 import struct
 import zlib
@@ -50,12 +51,20 @@ def png(path: Path, width: int, height: int, lines: list[tuple[str, int, int]]) 
 
 
 def main():
-    png(ROOT/'sce_sys/icon0.png',128,128,[('VI',9,33)])
-    base = ROOT/'sce_sys/livearea/contents'
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=ROOT/'build_livearea_fallback',
+                        help='Standalone fallback directory; never the packaged sce_sys')
+    args = parser.parse_args()
+    output = args.output.resolve()
+    packaged = (ROOT/'sce_sys').resolve()
+    if output == packaged or packaged in output.parents or output in packaged.parents:
+        parser.error('Fallback artwork must not overwrite the packaged LiveArea assets')
+    png(output/'icon0.png',128,128,[('VI',9,33)])
+    base = output/'livearea/contents'
     png(base/'bg0.png',840,500,[('FINAL FANTASY',5,80),('VI',28,160)])
     png(base/'startup.png',280,158,[('FINAL FANTASY',2,26),('VI',10,65)])
     png(base/'config.png',256,64,[('CONFIGURE',4,18)])
-    print('Generated four original indexed LiveArea images')
+    print('Generated historical fallback artwork in ' + str(output))
 
 if __name__ == '__main__':
     main()

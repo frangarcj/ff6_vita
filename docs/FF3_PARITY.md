@@ -8,7 +8,7 @@ RC1/RC2 validation reports predate that public version numbering.
 
 | Reference feature | FF6 implementation | Important difference / validation boundary |
 | --- | --- | --- |
-| LiveArea configuration companion | Packaged `companion.bin`, Configure target and original LiveArea assets | Launches independently of game data; shares the parser/defaults with the loader |
+| LiveArea configuration companion | Packaged `companion.bin` and Standard-Republic's Configuration button/layout | Launches independently of game data; shares the parser/defaults with the loader |
 | Save/launch/discard controls | Configurator buttons and START for save-and-launch | Temporary-file save preserves existing config on failure and retains unknown keys/comments |
 | Resolution selection | 960x544, 1280x725, 1920x1088, with VitaGL native fallback | Higher modes are experimental and require suitable output support; 480x320 world composition is unchanged |
 | Texture filtering / MSAA | Existing nearest/bilinear and 0/2x/4x MSAA options exposed in UI | Glyph atlases retain their separate linear-sampling exception |
@@ -17,8 +17,8 @@ RC1/RC2 validation reports predate that public version numbering.
 | Aspect ratios | Native 3:2 plus 4:3, 16:9, 2:1 and 21:9 presentation choices | FF6 is a fixed 2D composition, not FF3's adjustable 3D camera. The view stretches within the original game region and retains side panels. No extra scene content is revealed |
 | PostFX | Negative, FXAA, Sepia, Greyscale, CRT, CRT-Bleeding, CRT-Bleeding-Flat | Separate full-screen pass after world/UI composition, before system dialogs; FXAA uses the selected output size rather than fixed 960x544 |
 | Automatic builds | Push/PR/manual/dispatch CI with verified VPK and symbols | Adds host sanitizers, package tests and pinned source dependencies; no Android data is needed |
-| Tag releases | Version-tag workflow publishes via `gh` | RC tags are prereleases; existing releases are never overwritten; checksums and both matching ELFs are included |
-| Screenshots and application presentation | Original generated indexed PNGs and documented setup | No extracted commercial data is packaged |
+| Tag releases | Version-tag workflow publishes via `gh` | RC tags are prereleases; automatic runs never overwrite a release; an authorized manual RC repack is explicit and verified; checksums and both matching ELFs are included |
+| Screenshots and application presentation | Standard-Republic LiveArea artwork adapted to indexed PNGs, with `pic0.png` and documented setup | No Android executable, APK, OBB or saved games are packaged |
 
 ## Features retained specifically for FF6
 

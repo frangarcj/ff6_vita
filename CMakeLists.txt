@@ -96,18 +96,20 @@ foreach(shader ${FF6_POSTFX_SOURCES})
   list(APPEND VPK_FILE_ARGS "${shader}" "shaders/${shader_name}")
 endforeach()
 
-# LiveArea artwork is optional so the project builds before it exists.
+# Keep Standard-Republic's a3 layout and every referenced resource together.
 foreach(livearea_file
     sce_sys/icon0.png
+    sce_sys/pic0.png
     sce_sys/livearea/contents/bg0.png
-    sce_sys/livearea/contents/startup.png
-    sce_sys/livearea/contents/config.png
+    sce_sys/livearea/contents/frame4.png
+    sce_sys/livearea/contents/frame3.png
     sce_sys/livearea/contents/template.xml)
-  if(EXISTS "${CMAKE_SOURCE_DIR}/${livearea_file}")
-    list(APPEND VPK_FILE_ARGS
-      ${CMAKE_SOURCE_DIR}/${livearea_file} ${livearea_file}
-    )
+  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${livearea_file}")
+    message(FATAL_ERROR "Missing LiveArea resource: ${livearea_file}")
   endif()
+  list(APPEND VPK_FILE_ARGS
+    ${CMAKE_SOURCE_DIR}/${livearea_file} ${livearea_file}
+  )
 endforeach()
 
 add_executable(FF6.elf
