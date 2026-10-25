@@ -22,7 +22,8 @@
   "make_options": {
     "NO_DEBUG": 1,
     "NO_SPLASHSCREEN": 1,
-    "SHARED_RENDERTARGETS": 1
+    "SHARED_RENDERTARGETS": 1,
+    "ENABLE_LEGACY_PIPELINE": 1
   },
   "validated_compiler": "arm-vita-eabi-gcc 15.2.0",
   "notes": "Feature origin commits are recorded from the developer's local repository; they need not be publicly reachable. The bundled patch applies to the upstream base. Absolute debug paths and archive metadata can affect binary hashes; this is a source recipe, not a claim of byte-for-byte reproducibility."

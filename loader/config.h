@@ -39,6 +39,10 @@
 #define FILTER_LINEAR 1
 
 typedef struct {
+  int res;      /* 0 = 544p, 1 = 720p, 2 = 1080i; VitaGL can fall back to 544p. */
+  int postfx;   /* 0 = none, 1..7 = packaged full-screen effects. */
+  int swap_buttons; /* Swap Android confirm/cancel key events, including release. */
+  int aspect_ratio; /* 0 = native 3:2; 1..4 stretch presentation, never change FOV. */
   int bilinear; /* one of FILTER_* above */
   int lang;     /* 0 = system, otherwise getSystemLanguage() value + 1 */
   int msaa;     /* 0 = off, 1 = 2x, 2 = 4x */
@@ -47,9 +51,10 @@ typedef struct {
                       * 100 preserves that size; the substituted font has its
                       * own ascent/descent and still needs visual validation. */
   int offscreen;     /* 1 = draw the world into a buffer at its own 480x320
-                      * and stretch that once to the pillarbox. Sampling stays
-                      * 1:1 so tile seams cannot form, and it rasterises fewer
-                      * fragments than stretching every draw. */
+                      * and stretch that once to the pillarbox. Experimental:
+                      * UI clipping and scene transitions need validation. */
+  int sharp_bilinear; /* 1 = enable the world buffer and the sharp-bilinear
+                       * final pass; independent of atlas texture filtering. */
   int integer_scale; /* 1 = snap the game area to a whole multiple of the
                       * engine's own 480x320 composition space instead of
                       * stretching it to the 816x544 pillarbox. Only whole

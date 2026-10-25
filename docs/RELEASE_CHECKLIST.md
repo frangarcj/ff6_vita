@@ -1,18 +1,25 @@
 # Release candidate checklist
 
-Working label: **1.0.0-rc1 (2026-10-25)**.
+Public candidate: **v1.0.0-rc1**. Earlier local RC1/RC2 snapshots and their
+evidence are preserved; those names were not public GitHub release numbers.
 
-Status: **font fixes implemented; one emulator menu checked; broader visual
-validation and hardware acceptance pending**. The reported small fonts and
-intermittently missing letters led to metric, bitmap-clipping and glyph-upload
-corrections with host regressions. The updated resume-confirmation menu was
-readable in the emulator; additional scenes still need visual checks.
+The public candidate adds the [FF3 parity features](FF3_PARITY.md), Configurator,
+LiveArea, PostFX and automated build/release workflows. Its authoritative
+revision and checksums belong to the bundle attached to the GitHub tag, not to
+the older local snapshots listed below. These additions do not close hardware
+or full-game acceptance gates.
+
+Status: **vertical text alignment and sharp-bilinear battle-menu clipping
+corrected; Release diagnostics cleaned; broader acceptance pending**.
+The [RC2 report](RC2_VALIDATION_2026-10-25.md) records the follow-up host tests,
+menu captures, diagnostic cleanup and candidate identity. The preparation
+checks below also retain historical RC1 evidence; those observations are not
+automatically evidence for every later build.
 This document records the release gates. A build, an emulator screenshot or a
 historical observation does not mark a hardware gate complete.
 
-See [the dated validation report](VALIDATION_2026-10-25.md) for the actual
-checks, their evidence and their limits. The current candidate is not a
-stable-release signoff.
+See [the RC1 validation report](VALIDATION_2026-10-25.md) for the earlier
+checks and their limits. The current candidate is not a stable-release signoff.
 
 ## Recovered baseline
 
@@ -88,16 +95,17 @@ changes and inspect the final staged artifacts.
 
 ## Candidate identity and provenance
 
-The authoritative revision, build inputs and checksums will be generated in
-`release/2026-10-25-rc1/manifest.json` and `SHA256SUMS` after final fixes and a
-clean source commit. This tracked checklist deliberately does not embed its
-own final commit identifier. Do not infer Android versions from APK filenames
-or use a different build's ELF to analyze a crash.
+The authoritative revision, dirty state, build inputs and checksums for RC2
+are recorded in `release/2026-10-25-rc2/manifest.json` and `SHA256SUMS` when
+staged. This local candidate may have uncommitted source changes: review the
+manifest rather than treating the baseline revision alone as its identity.
+No publication or source commit is implied. Do not infer Android versions
+from APK filenames or use a different build's ELF to analyze a crash.
 
 | Field | Value |
 | --- | --- |
 | Source revision and local modifications | Authoritative values in the final staged `manifest.json` (`source_revision` / `source_dirty`) |
-| Candidate label | `1.0.0-rc1`, dated 2026-10-25; preparation label until remaining fixes and staging finish |
+| Candidate label | `1.0.0-rc2`, dated 2026-10-25; local candidate, not published or signed off as stable |
 | SFO title ID | `FF6000000` |
 | SFO application version | `01.00`, accepted by the candidate package checks; distinct from the RC label |
 | Release VPK path and SHA-256 | `release/2026-10-25-rc1/FF6.vpk`; checksum in the final staged `SHA256SUMS` |

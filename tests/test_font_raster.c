@@ -76,13 +76,13 @@ static void test_font(const char *path) {
                      &font, (float)sizes[i])) < 0.000001f);
     assert(metrics.ascent > 0 && metrics.descent >= 0);
     assert(metrics.ascent + metrics.descent <= 640);
-    compare_crop(&font, 'j', metrics.scale, 0, metrics.ascent);
-    compare_crop(&font, 'j', metrics.scale, -3, metrics.ascent);
+    compare_crop(&font, 'j', metrics.scale, 0, metrics.baseline);
+    compare_crop(&font, 'j', metrics.scale, -3, metrics.baseline);
     compare_crop(&font, 'A', metrics.scale, 7, 3);
-    compare_crop(&font, 'W', metrics.scale, WIDTH - 2, metrics.ascent);
+    compare_crop(&font, 'W', metrics.scale, WIDTH - 2, metrics.baseline);
     compare_crop(&font, 'g', metrics.scale, 7, HEIGHT + 1);
-    compare_crop(&font, 'W', metrics.scale, WIDTH + 10, metrics.ascent);
-    compare_crop(&font, ' ', metrics.scale, 0, metrics.ascent);
+    compare_crop(&font, 'W', metrics.scale, WIDTH + 10, metrics.baseline);
+    compare_crop(&font, ' ', metrics.scale, 0, metrics.baseline);
   }
 
   ff6_font_metrics metrics = ff6_measure_font(&font, 19, 100, 640);
@@ -92,7 +92,7 @@ static void test_font(const char *path) {
   for (int cp = 33; cp <= 126; cp++) {
     memset(canvas, 0, sizeof(canvas));
     assert(stbtt_FindGlyphIndex(&font, cp) != 0);
-    assert(ff6_raster_glyph(&font, cp, metrics.scale, 0, metrics.ascent,
+    assert(ff6_raster_glyph(&font, cp, metrics.scale, 0, metrics.baseline,
                             canvas, WIDTH, HEIGHT, WIDTH));
     size_t ink = 0;
     for (size_t j = 0; j < sizeof(canvas); j++) ink += canvas[j] != 0;
@@ -100,11 +100,11 @@ static void test_font(const char *path) {
   }
   for (size_t i = 0; i < sizeof(extra) / sizeof(extra[0]); i++) {
     assert(stbtt_FindGlyphIndex(&font, extra[i]) != 0);
-    compare_crop(&font, extra[i], metrics.scale, 0, metrics.ascent);
+    compare_crop(&font, extra[i], metrics.scale, 0, metrics.baseline);
   }
 
   memset(canvas, 127, sizeof(canvas));
-  assert(ff6_raster_glyph(&font, 'j', metrics.scale, 0, metrics.ascent,
+  assert(ff6_raster_glyph(&font, 'j', metrics.scale, 0, metrics.baseline,
                           canvas, WIDTH, HEIGHT, WIDTH));
   for (size_t i = 0; i < sizeof(canvas); i++) assert(canvas[i] >= 127);
 

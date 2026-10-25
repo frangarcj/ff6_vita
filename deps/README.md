@@ -28,7 +28,7 @@ git clone https://github.com/Rinnegatamante/vitaGL build_release/deps/vitaGL
 git -C build_release/deps/vitaGL checkout --detach c707ff00d9a372f0ba7056b4a4b723f5a00ba880
 git -C build_release/deps/vitaGL apply --check "$FF6_ROOT/deps/vitagl-ff6.patch"
 git -C build_release/deps/vitaGL apply "$FF6_ROOT/deps/vitagl-ff6.patch"
-make -C build_release/deps/vitaGL NO_DEBUG=1 NO_SPLASHSCREEN=1 SHARED_RENDERTARGETS=1 -j4
+make -C build_release/deps/vitaGL NO_DEBUG=1 NO_SPLASHSCREEN=1 SHARED_RENDERTARGETS=1 ENABLE_LEGACY_PIPELINE=1 -j4
 cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DFF6_DEBUG=OFF \
   -DVITAGL_INCLUDE_DIR="$FF6_ROOT/build_release/deps/vitaGL/source" \
   -DVITAGL_LIBRARY="$FF6_ROOT/build_release/deps/vitaGL/libvitaGL.a"
@@ -46,7 +46,10 @@ their changes are supplied by the bundled patch.
 
 `NO_DEBUG=1` turns off vitaGL error checks, `NO_SPLASHSCREEN=1` avoids an
 extra splash/context initialization, and `SHARED_RENDERTARGETS=1` enables
-the render-target mode used by this port. Keep these settings with the
+the render-target mode used by this port. `ENABLE_LEGACY_PIPELINE=1` is also
+required by ImGui's `vglDrawObjects` backend in the Configurator; without it
+the function exists but does not draw. Rebuild vitaGL from clean objects after
+changing these flags. Keep these settings with the
 candidate. A separate instrumented graphics build can use `LOG_ERRORS=1`
 without `NO_DEBUG=1` when diagnosing a rendering issue.
 

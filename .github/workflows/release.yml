@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (for example v1.0.0-rc1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Validate release tag
+        id: check
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+            echo "Expected a version tag or RC tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: identity
+    uses: ./.github/workflows/compilation.yml
+    with:
+      ref: ${{ needs.identity.outputs.tag }}
+    permissions:
+      contents: read
+
+  publish:
+    needs: [identity, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.identity.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: release_bundle
+      - name: Verify assets match the tag
+        run: |
+          cd release_bundle
+          sha256sum -c SHA256SUMS
+          python3 - <<'PY'
+          import json, subprocess
+          manifest = json.load(open('manifest.json'))
+          commit = subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          assert manifest['source_revision'] == commit
+          assert manifest['source_dirty'] is False
+          assert manifest['ff6_debug'] is False
+          PY
+      - name: Publish using GitHub CLI (never replace existing releases)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.identity.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite published assets." >&2
+            exit 1
+          fi
+          args=(--verify-tag --title "Final Fantasy VI Vita $TAG")
+          if [[ "$TAG" == *-rc* ]]; then
+            args+=(--prerelease --latest=false)
+          fi
+          if [[ -f "docs/releases/$TAG.md" ]]; then
+            args+=(--notes-file "docs/releases/$TAG.md")
+          else
+            args+=(--generate-notes)
+          fi
+          gh release create "$TAG" "${args[@]}" \
+            release_bundle/FF6.vpk release_bundle/FF6.elf \
+            release_bundle/companion.elf release_bundle/manifest.json \
+            release_bundle/SHA256SUMS

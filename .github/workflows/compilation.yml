@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  repository_dispatch:
+    types: [run_build]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        required: false
+        type: string
+        default: ''
+    outputs:
+      artifact:
+        description: Verified release bundle artifact name
+        value: ${{ jobs.vita.outputs.artifact }}
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Host regressions (ASan and UBSan)
+        run: python3 tools/run_host_tests.py
+
+  vita:
+    needs: host-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    container: vitasdk/vitasdk:latest
+    outputs:
+      artifact: ${{ steps.info.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build pinned dependencies in isolated SDK
+        run: python3 tools/build_dependencies.py --directory build_ci/deps --jobs 4
+      - name: Configure Release
+        run: >-
+          cmake -S . -B build_ci -DCMAKE_BUILD_TYPE=Release -DFF6_DEBUG=OFF
+          -DVITAGL_INCLUDE_DIR="$PWD/build_ci/deps/vitaGL/source"
+          -DVITAGL_LIBRARY="$PWD/build_ci/deps/vitaGL/libvitaGL.a"
+      - name: Build complete game and Configurator package
+        run: cmake --build build_ci --target FF6.vpk-vpk --parallel 4
+      - name: Verify package, diagnostics and provenance
+        run: |
+          python3 tests/test_release_profile.py build_ci/FF6.elf
+          python3 tests/test_release_profile.py build_ci/companion.elf
+          python3 tools/check_release.py build_ci --output release/ci
+          cd release/ci
+          sha256sum -c SHA256SUMS
+      - name: Artifact identity
+        id: info
+        run: echo "artifact=FF6-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.info.outputs.artifact }}
+          path: release/ci/*
+          if-no-files-found: error
+          retention-days: 30

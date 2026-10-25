@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "reference": {
+    "repository": "https://github.com/frangarcj/ff3_vita",
+    "commit": "f08d74fb29b149134465f212257766ce86de6878"
+  },
+  "opensles": {
+    "repository": "https://github.com/frangarcj/opensles",
+    "commit": "e35b0630ac4c9091db63374d5c111d719887dde9"
+  },
+  "imgui": {
+    "repository": "https://github.com/Rinnegatamante/imgui-vita",
+    "commit": "a0562251489838cc45b7ea287fa5304d090697f5"
+  },
+  "vitagl": "deps/vitagl.lock.json",
+  "sdk_image": "vitasdk/vitasdk:latest",
+  "notes": "The SDK image follows the FF3 workflow. Source dependencies and the FF6 graphics patch are pinned; release manifests fingerprint the actual compiler and linked archives. This does not claim bit-identical output across SDK image updates."
+}

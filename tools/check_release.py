@@ -25,16 +25,31 @@ FONTS = (
     "NotoSansKR-Regular.ttf",
     "NotoSansSC-Regular.ttf",
 )
-NOTICES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/OFL-Noto.txt")
+NOTICES = ("LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/OFL-Noto.txt", "licenses/MIT-ImGui.txt")
 ARTWORK = (
     "sce_sys/icon0.png",
     "sce_sys/livearea/contents/bg0.png",
     "sce_sys/livearea/contents/startup.png",
+    "sce_sys/livearea/contents/config.png",
     "sce_sys/livearea/contents/template.xml",
 )
-REQUIRED = {"eboot.bin", "sce_sys/param.sfo", *FONTS, *NOTICES}
+SHADERS = tuple("shaders/" + name + suffix for name in (
+    "1_Negative", "2_FXAA", "3_Sepia", "4_Greyscale", "5_CRT",
+    "6_CRT-Bleeding", "7_CRT-Bleeding-Flat") for suffix in ("_v.cg", "_f.cg"))
+REQUIRED = {"eboot.bin", "companion.bin", "sce_sys/param.sfo",
+            *FONTS, *NOTICES, *ARTWORK, *SHADERS}
 RELEASE_MARKER = b"FF6_BUILD_PROFILE=release\0"
 DEBUG_MARKER = b"FF6_BUILD_PROFILE=debug\0"
+DIAGNOSTIC_MARKERS = (
+    b"ux0:data/ff6/boot.log",
+    b"ux0:data/ff6/upscale-status.txt",
+    b"ux0:data/ff6/autoplay.trigger",
+    b"ux0:data/ff6/autoplay-stop-battle.trigger",
+    b"ux0:data/ff6/save.trigger",
+    b"ux0:data/ff6/dump.trigger",
+    b"[frame-time]",
+    b"holding 15s",
+)
 
 
 def require(condition, message):
@@ -75,8 +90,8 @@ def source_state(source):
         return None, None
 
 
-def linked_archives(build, cache, elf):
-    link = build / "CMakeFiles/FF6.elf.dir/link.txt"
+def linked_archives(build, cache, elf, target="FF6.elf"):
+    link = build / ("CMakeFiles/" + target + ".dir/link.txt")
     require(link.is_file() and link.stat().st_size <= 65536,
             "Missing or oversized CMake link.txt; use the documented Makefiles build")
     command = shlex.split(link.read_text(encoding="utf-8"))
@@ -152,6 +167,9 @@ def inspect_elf(path):
     require(header[1] == 40, "FF6.elf is not an ARM binary")
     require(RELEASE_MARKER in data and DEBUG_MARKER not in data,
             "FF6.elf is instrumented or lacks the release build marker; rebuild")
+    for marker in DIAGNOSTIC_MARKERS:
+        require(marker not in data,
+                "FF6.elf contains a development diagnostic: " + marker.decode("ascii"))
     section_offset, entry_size, count, names_index = (
         header[5], header[10], header[11], header[12])
     require(entry_size == 40 and 0 < names_index < count
@@ -192,6 +210,13 @@ def validate(build):
             <= vpk.stat().st_mtime_ns,
             "Package or eboot is older than its input; finish the CMake build")
     elf_info = inspect_elf(elf)
+    companion = build / "companion.bin"
+    companion_elf = build / "companion.elf"
+    require(companion.is_file() and companion_elf.is_file(),
+            "Missing Configurator binary or matching ELF")
+    require(companion_elf.stat().st_mtime_ns <= companion.stat().st_mtime_ns
+            <= vpk.stat().st_mtime_ns, "Rebuild the Configurator and VPK")
+    companion_info = inspect_elf(companion_elf)
 
     contents = []
     with zipfile.ZipFile(vpk) as archive:
@@ -231,7 +256,9 @@ def validate(build):
                              "sha256": digest})
             if item.filename == "eboot.bin":
                 require(digest == sha256(eboot), "VPK contains a different eboot.bin")
-            elif item.filename in FONTS + NOTICES or item.filename.startswith("licenses/"):
+            elif item.filename == "companion.bin":
+                require(digest == sha256(companion), "VPK contains a different companion.bin")
+            elif item.filename in FONTS + NOTICES + ARTWORK + SHADERS or item.filename.startswith("licenses/"):
                 original = source / item.filename
                 require(original.is_file() and digest == sha256(original),
                         "VPK resource differs from source: " + item.filename)
@@ -258,7 +285,7 @@ def validate(build):
     revision, dirty = source_state(source)
     dependency_sources = [
         {"file": name, "sha256": sha256(source / name)}
-        for name in ("deps/vitagl-ff6.patch", "deps/vitagl.lock.json")
+        for name in ("deps/vitagl-ff6.patch", "deps/vitagl.lock.json", "deps/build.lock.json")
         if (source / name).is_file()
     ]
     manifest = {
@@ -273,13 +300,16 @@ def validate(build):
         "source_dirty": dirty,
         "source_provenance_scope": "Checkout state at validation, not an embedded build revision. Rebuild after changing source.",
         "elf": elf_info,
+        "companion_elf": companion_info,
+        "companion_sha256": sha256(companion),
         "artifacts": [
             {"file": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
-            for path in (vpk, elf)
+            for path in (vpk, elf, companion_elf)
         ],
         "eboot_sha256": sha256(eboot),
         "dependencies": dependency,
         "link": linked_archives(build, cache, elf),
+        "companion_link": linked_archives(build, cache, companion_elf, "companion.elf"),
         "dependency_sources": dependency_sources,
         "vpk_contents": sorted(contents, key=lambda item: item["path"]),
         "missing_optional_artwork": sorted(set(ARTWORK) - set(names)),
@@ -308,7 +338,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("build_dir", nargs="?", type=Path, default=Path("build_release"))
     parser.add_argument("--output", type=Path,
-                        help="Stage FF6.vpk, FF6.elf, manifest.json and SHA256SUMS here")
+                        help="Stage the VPK, matching game/Configurator ELFs, manifest and checksums")
     args = parser.parse_args()
     build = args.build_dir.resolve()
     try:
@@ -324,7 +354,7 @@ def main():
             encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
             atomic_write(output / "manifest.json", data=encoded)
             sums = "".join(sha256(output / name) + "  " + name + "\n"
-                           for name in ("FF6.vpk", "FF6.elf", "manifest.json"))
+                           for name in ("FF6.vpk", "FF6.elf", "companion.elf", "manifest.json"))
             atomic_write(output / "SHA256SUMS", data=sums.encode())
             print("Staged verified artifacts in " + str(output))
         print("PASS: " + manifest["title_id"] + " " + manifest["app_version"]

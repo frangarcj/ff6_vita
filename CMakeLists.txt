@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.16)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(DEFINED ENV{VITASDK})
@@ -18,7 +18,7 @@ set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -Wl,-q,--wrap,memcpy,--wrap,memmove,--wrap,memset -Wall -O3 -mfloat-abi=hard")
 set(CMAKE_CXX_FLAGS "${CMAKE_C_FLAGS} -std=c++17")
 
-option(FF6_DEBUG "Build with the black-screen-hunt instrumentation (GL logging, probes, watchdog, boot.log tracing)" OFF)
+option(FF6_DEBUG "Build with optional diagnostics (GL logging, frame timing, watchdog, boot.log and opt-in autoplay)" OFF)
 if(FF6_DEBUG)
   add_definitions(-DFF6_DEBUG)
 endif()
@@ -86,13 +86,22 @@ set(VPK_FILE_ARGS
   ${CMAKE_SOURCE_DIR}/LICENSE LICENSE
   ${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.md
   ${CMAKE_SOURCE_DIR}/licenses/OFL-Noto.txt licenses/OFL-Noto.txt
+  ${CMAKE_SOURCE_DIR}/licenses/MIT-ImGui.txt licenses/MIT-ImGui.txt
+  ${CMAKE_BINARY_DIR}/companion.bin companion.bin
 )
+
+file(GLOB FF6_POSTFX_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/shaders/*.cg")
+foreach(shader ${FF6_POSTFX_SOURCES})
+  get_filename_component(shader_name "${shader}" NAME)
+  list(APPEND VPK_FILE_ARGS "${shader}" "shaders/${shader_name}")
+endforeach()
 
 # LiveArea artwork is optional so the project builds before it exists.
 foreach(livearea_file
     sce_sys/icon0.png
     sce_sys/livearea/contents/bg0.png
     sce_sys/livearea/contents/startup.png
+    sce_sys/livearea/contents/config.png
     sce_sys/livearea/contents/template.xml)
   if(EXISTS "${CMAKE_SOURCE_DIR}/${livearea_file}")
     list(APPEND VPK_FILE_ARGS
@@ -158,20 +167,32 @@ target_link_libraries(FF6.elf
 
 vita_create_self(eboot.bin FF6.elf UNSAFE)
 
+add_executable(companion.elf ${CMAKE_CURRENT_BINARY_DIR}/build_profile.c companion/main.cpp)
+target_include_directories(companion.elf BEFORE PRIVATE "${VITAGL_INCLUDE_DIR}")
+target_link_libraries(companion.elf
+  m stdc++ imgui "${VITAGL_LIBRARY}" vitashark mathneon
+  SceAppMgr_stub SceAppUtil_stub SceAudio_stub SceCtrl_stub SceCommonDialog_stub
+  SceDisplay_stub SceKernelDmacMgr_stub SceGxm_stub SceShaccCg_stub SceShaccCgExt
+  SceSysmodule_stub SceTouch_stub SceVshBridge_stub taihen_stub)
+vita_create_self(companion.bin companion.elf UNSAFE)
+
 vita_create_vpk(FF6.vpk ${VITA_TITLEID} eboot.bin
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
   FILE ${VPK_FILE_ARGS}
 )
+add_dependencies(FF6.vpk-vpk companion.bin-self)
 
 add_custom_target(copy
   COMMAND echo "destroy" | nc $(PSVITAIP) 1338
   COMMAND curl -T eboot.bin ftp://$(PSVITAIP):1337/ux0:/app/${VITA_TITLEID}/eboot.bin DEPENDS eboot.bin
+  COMMAND curl -T companion.bin ftp://$(PSVITAIP):1337/ux0:/app/${VITA_TITLEID}/companion.bin DEPENDS companion.bin
 )
 
 add_custom_target(launch
   COMMAND echo "screen on" | nc $(PSVITAIP) 1338
   COMMAND echo "destroy" | nc $(PSVITAIP) 1338
   COMMAND curl -T eboot.bin ftp://$(PSVITAIP):1337/ux0:/app/${VITA_TITLEID}/eboot.bin DEPENDS eboot.bin
+  COMMAND curl -T companion.bin ftp://$(PSVITAIP):1337/ux0:/app/${VITA_TITLEID}/companion.bin DEPENDS companion.bin
   COMMAND echo "launch ${VITA_TITLEID}" | nc $(PSVITAIP) 1338
 )

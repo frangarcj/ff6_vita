@@ -11,6 +11,7 @@ enum { FF6_GLYPH_ATLAS_SIZE = 1024 };
 
 typedef struct {
   int x, y, width, height;
+  int bitmap_width, bitmap_height;
 } ff6_glyph_region;
 
 /* The reference engine owns one glyph cache with two atlas pages. Keep only
@@ -41,7 +42,7 @@ static inline void ff6_forget_glyph_texture(ff6_glyph_textures *textures,
 static inline int ff6_make_glyph_region(int slot, int cell, int width,
                                       int height, ff6_glyph_region *region) {
   if (!region || slot < 0 || cell <= 0 || cell > FF6_GLYPH_ATLAS_SIZE ||
-      width <= 0 || width > TEXT_IMG_W || height <= 0 || height > TEXT_IMG_H)
+      width < 0 || width > TEXT_IMG_W || height <= 0 || height > TEXT_IMG_H)
     return 0;
 
   int per_row = FF6_GLYPH_ATLAS_SIZE / cell;
@@ -49,29 +50,41 @@ static inline int ff6_make_glyph_region(int slot, int cell, int width,
   /* Both native drawGlyph and Draw wrap the row. The native registration
    * guard admits slot == per_row*per_row before resetting the cache. */
   region->y = ((slot / per_row) % per_row) * cell;
-  region->width = width < cell ? width : cell;
-  region->height = height < cell ? height : cell;
+  /* Linear filtering can sample just beyond the new glyph's bounds. Replace
+   * the entire cell so a narrower/shorter glyph cannot expose its predecessor. */
+  region->width = region->height = cell;
+  region->bitmap_width = width < cell ? width : cell;
+  region->bitmap_height = height < cell ? height : cell;
   return 1;
 }
 
-/* region must come from ff6_make_glyph_region. Its bounds limit allocation
- * to TEXT_IMG_W*TEXT_IMG_H pixels and keep every source row in the bitmap.
- * The caller owns the reusable buffer; allocation failure leaves it intact. */
+/* The upload is at most one atlas-sized cell; source reads remain bounded by
+ * TEXT_IMG_W*TEXT_IMG_H. Unused cell pixels are transparent, including rows
+ * below the source bitmap. Allocation failure leaves the reusable buffer intact. */
 static inline int ff6_pack_glyph(const uint32_t *pixels,
                                 const ff6_glyph_region *region,
                                 uint32_t **buffer, size_t *capacity) {
+  if (!pixels || !region || !buffer || !capacity ||
+      region->width <= 0 || region->width > FF6_GLYPH_ATLAS_SIZE ||
+      region->height <= 0 || region->height > FF6_GLYPH_ATLAS_SIZE ||
+      region->bitmap_width < 0 || region->bitmap_width > region->width ||
+      region->bitmap_width > TEXT_IMG_W || region->bitmap_height < 0 ||
+      region->bitmap_height > region->height || region->bitmap_height > TEXT_IMG_H)
+    return 0;
+
   size_t count = (size_t)region->width * (size_t)region->height;
-  if (*capacity < count) {
+  if (!*buffer || *capacity < count) {
     uint32_t *grown = (uint32_t *)realloc(*buffer, count * sizeof(*grown));
     if (!grown)
       return 0;
     *buffer = grown;
     *capacity = count;
   }
-  for (int y = 0; y < region->height; y++)
+  memset(*buffer, 0, count * sizeof(**buffer));
+  for (int y = 0; y < region->bitmap_height; y++)
     memcpy(*buffer + (size_t)y * region->width,
            pixels + (size_t)y * TEXT_IMG_W,
-           (size_t)region->width * sizeof(**buffer));
+           (size_t)region->bitmap_width * sizeof(**buffer));
   return 1;
 }
 

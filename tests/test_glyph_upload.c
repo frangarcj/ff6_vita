@@ -46,17 +46,21 @@ static void test_atlas_boundary(void) {
   assert(region.x == 0 && region.y == 0);
   assert(ff6_make_glyph_region(1, 1024, 1024, 640, &region));
   assert(region.x == 0 && region.y == 0);
-  assert(region.width == 1024 && region.height == 640);
+  assert(region.width == 1024 && region.height == 1024);
+  assert(region.bitmap_width == 1024 && region.bitmap_height == 640);
 
   /* Keep the existing cell clipping behavior, even for oversized metrics. */
   assert(ff6_make_glyph_region(1023, 32, 90, 70, &region));
   assert(region.width == 32 && region.height == 32);
+  assert(region.bitmap_width == 32 && region.bitmap_height == 32);
   assert(!ff6_make_glyph_region(-1, 32, 20, 20, &region));
   assert(!ff6_make_glyph_region(0, 0, 20, 20, &region));
   assert(!ff6_make_glyph_region(0, INT_MAX, 20, 20, &region));
   assert(!ff6_make_glyph_region(0, 32, INT_MAX, 20, &region));
   assert(!ff6_make_glyph_region(0, 32, 20, INT_MAX, &region));
-  assert(!ff6_make_glyph_region(0, 32, 0, 20, &region));
+  assert(ff6_make_glyph_region(0, 32, 0, 20, &region));
+  assert(region.bitmap_width == 0);
+  assert(!ff6_make_glyph_region(0, 32, -1, 20, &region));
   assert(!ff6_make_glyph_region(0, 32, 20, 0, &region));
   assert(!ff6_make_glyph_region(0, 32, 20, 20, NULL));
 }
@@ -76,23 +80,39 @@ static void test_large_strided_upload(void) {
    * bitmap still has a 1024-pixel stride, not the glyph's upload width. */
   assert(ff6_make_glyph_region(3, 96, 65, 80, &region));
   assert(ff6_pack_glyph(source, &region, &packed, &capacity));
-  assert(capacity == 65 * 80);
-  for (int y = 0; y < 80; y++)
-    for (int x = 0; x < 65; x++)
-      assert(packed[y * 65 + x] == (((uint32_t)y << 16) | (uint32_t)x));
+  assert(capacity == 96 * 96);
+  for (int y = 0; y < 96; y++)
+    for (int x = 0; x < 96; x++) {
+      uint32_t expected = (x < 65 && y < 80)
+                              ? (((uint32_t)y << 16) | (uint32_t)x) : 0;
+      assert(packed[y * 96 + x] == expected);
+    }
 
   uint32_t *previous = packed;
   packed[32 * 32] = 0xA5A5A5A5;
   assert(ff6_make_glyph_region(0, 32, 65, 80, &region));
   assert(ff6_pack_glyph(source, &region, &packed, &capacity));
-  assert(packed == previous && capacity == 65 * 80);
+  assert(packed == previous && capacity == 96 * 96);
   assert(packed[31 * 32 + 31] == 0x001F001F);
   assert(packed[32 * 32] == 0xA5A5A5A5);
 
   assert(ff6_make_glyph_region(0, 1024, 1024, 640, &region));
   assert(ff6_pack_glyph(source, &region, &packed, &capacity));
-  assert(capacity == pixel_count);
+  assert(capacity == (size_t)1024 * 1024);
   assert(memcmp(source, packed, pixel_count * sizeof(*source)) == 0);
+  for (size_t i = pixel_count; i < capacity; i++)
+    assert(packed[i] == 0);
+  previous = packed;
+  assert(!ff6_pack_glyph(NULL, &region, &packed, &capacity));
+  assert(!ff6_pack_glyph(source, NULL, &packed, &capacity));
+  assert(!ff6_pack_glyph(source, &region, NULL, &capacity));
+  assert(!ff6_pack_glyph(source, &region, &packed, NULL));
+  region.bitmap_height = TEXT_IMG_H + 1;
+  assert(!ff6_pack_glyph(source, &region, &packed, &capacity));
+  region.bitmap_height = TEXT_IMG_H;
+  region.bitmap_width = -1;
+  assert(!ff6_pack_glyph(source, &region, &packed, &capacity));
+  assert(packed == previous);
   free(packed);
   free(source);
 }

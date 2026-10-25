@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible problem with the Vita port
+body:
+  - type: markdown
+    attributes:
+      value: Please do not attach APK, OBB, libFF6.so or other commercial game data. Back up saved games before testing.
+  - type: input
+    id: version
+    attributes:
+      label: Release tag or commit
+      placeholder: v1.0.0-rc1
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Device and environment
+      description: Vita/PSTV model, firmware and relevant plugins; for emulation include the emulator revision and host OS.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Paste options.cfg or state that defaults were used. Include PostFX, sharp-bilinear, resolution and language.
+      render: ini
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps, expected result and actual result
+      description: Name the scene/menu, distinguish first use from repeated use, and include a screenshot or crash report when possible.
+    validations:
+      required: true
+  - type: checkboxes
+    id: data
+    attributes:
+      label: Supported data
+      options:
+        - label: I verified the compatible Android 2.1.6 data hashes listed in the README.
+        - label: I tested the default rendering configuration as well as the affected optional setting.

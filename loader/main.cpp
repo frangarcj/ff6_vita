@@ -81,10 +81,12 @@ extern "C" {
 
 #include "softfp_wrappers.hpp"
 #include "glyph_upload.h"
+#include "options.h"
+#include "display_layout.h"
 
-/* FF6_DEBUG selects the black-screen-hunt instrumentation: GL call logging,
- * per-frame dumps, on-screen probes, the hang watchdog and the boot.log
- * tracer. Release builds keep only the functional shims and fixes.
+/* FF6_DEBUG selects optional GL logging, frame timing, opt-in dumps/autoplay,
+ * the watchdog and boot.log tracing. It must not inject draws or waits into
+ * presentation. Release builds keep only the functional shims and fixes.
  * DBG_ALT picks the instrumented or the plain symbol-table entry. */
 #ifdef FF6_DEBUG
 #define DBG_ALT(dbg, rel) (dbg)
@@ -95,6 +97,11 @@ extern "C" {
 /* Defined further down with the offscreen buffer; the swap needs these. */
 static void present_scene_fbo(void);
 static void bind_scene_fbo(void);
+static int get_scene_scissor(GLint *params);
+static void init_postfx(void);
+static void present_postfx(void);
+static void begin_postfx(void);
+static GLuint display_target(void);
 
 int SCREEN_W = DEF_SCREEN_W;
 int SCREEN_H = DEF_SCREEN_H;
@@ -116,54 +123,9 @@ void *__wrap_memmove(void *dest, const void *src, size_t n) {
 void *__wrap_memset(void *s, int c, size_t n) { return sceClibMemset(s, c, n); }
 }
 
-static void set_default_options(void) {
-  options.bilinear = 0;
-  options.lang = 0;
-  options.msaa = 2;
-  options.sound = 1;
-  options.integer_scale = 0;
-  options.offscreen = 0;
-  options.font_scale = 100;
-  options.inplace_tex = 1;
-  options.fixed_color_native = 0;
-}
-
 static void loadOptions(void) {
-  char line[128];
-  char key[32];
-  int value = 0;
-
-  set_default_options();
-
-  FILE *f = fopen(CONFIG_FILE_PATH, "rb");
-  if (!f)
-    return;
-
-  while (fgets(line, sizeof(line), f)) {
-    if (sscanf(line, "%31[^=]=%d", key, &value) != 2)
-      continue;
-
-    if (strcmp("bilinear", key) == 0)
-      options.bilinear = value;
-    else if (strcmp("language", key) == 0)
-      options.lang = value;
-    else if (strcmp("antialiasing", key) == 0)
-      options.msaa = value;
-    else if (strcmp("sound", key) == 0)
-      options.sound = value;
-    else if (strcmp("integerscale", key) == 0)
-      options.integer_scale = value;
-    else if (strcmp("offscreen", key) == 0)
-      options.offscreen = value;
-    else if (strcmp("fontscale", key) == 0)
-      options.font_scale = value > 0 ? value : 100;
-    else if (strcmp("inplacetex", key) == 0)
-      options.inplace_tex = value;
-    else if (strcmp("fixedcolor", key) == 0)
-      options.fixed_color_native = value;
-  }
-
-  fclose(f);
+  ff6_load_options(CONFIG_FILE_PATH, &options);
+  ff6_output_size(options.res, &SCREEN_W, &SCREEN_H);
 }
 
 /* ==========================================================================
@@ -1407,11 +1369,6 @@ static SOFTFP_ABI float AMotionEvent_getY(const void *e, size_t index) {
 
 #ifdef FF6_DEBUG
 static void gl_stats_report(void);
-
-/* Set when the current frame contained a scene draw that must be plainly
- * visible: opaque per-vertex colours and a texture known to hold bright
- * content. The swap then freezes so a screenshot can catch that exact frame. */
-static int frame_has_bright_scene_draw;
 #endif
 
 #define FAKE_EGL_DISPLAY ((void *)0xE9100001)
@@ -1487,205 +1444,9 @@ static unsigned fake_eglQuerySurface(void *dpy, void *surface, int attribute,
 }
 
 
-#ifdef FF6_DEBUG
-/* DIAGNOSTIC: two solid quads drawn through exactly the path the scene uses
- * (GL_FLOAT vertex array, same ortho), one under the pillarboxed viewport the
- * scene gets and one under the full-screen viewport the visible side panels
- * get. Whichever shows up says where the scene is being lost. */
-GLuint probe_texture;
-
-/* Snapshot of the frame's first scene draw, replayed just before the swap --
- * the one spot where drawing is known to reach the screen. If the very same
- * call works there but not where the game issues it, the draw state is fine
- * and the problem is when it happens; if it fails in both places, the state
- * itself is at fault. */
-static struct {
-  int valid;
-  GLuint texture;
-  GLint vsize, csize, tsize;
-  GLenum vtype, ctype, ttype;
-  GLsizei vstride, cstride, tstride;
-  const void *vptr, *cptr, *tptr;
-  GLboolean colour_array;
-  /* Client arrays are read at draw time, so replaying at swap with the game's
-   * pointers reads whatever the engine last scribbled there. Snapshot the
-   * actual bytes at capture time instead. */
-  unsigned char vdata[64], cdata[64], tdata[64];
-} scene_draw;
-
-static void draw_viewport_probe(void) {
-  static const GLfloat left_half[] = {0, 0, 254, 240, 0, 254,
-                                      0, 320, 254, 240, 320, 254};
-  static const GLfloat right_half[] = {240, 0,   254, 480, 0,   254,
-                                       240, 320, 254, 480, 320, 254};
-
-  glDisable(GL_TEXTURE_2D);
-  glDisable(GL_BLEND);
-  glDisable(GL_DEPTH_TEST);
-  glDisable(GL_ALPHA_TEST);
-
-  glMatrixMode(GL_PROJECTION);
-  glLoadIdentity();
-  glOrthof(0.0f, 480.0f, 320.0f, 0.0f, 0.0f, -255.0f);
-  glMatrixMode(GL_MODELVIEW);
-  glLoadIdentity();
-
-  glEnableClientState(GL_VERTEX_ARRAY);
-  glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-  glDisableClientState(GL_COLOR_ARRAY);
-
-  /* RED, left half, under the scene's pillarboxed viewport */
-  glViewport(72, 0, 816, 544);
-  glColor4f(1.0f, 0.0f, 0.0f, 1.0f);
-  glVertexPointer(3, GL_FLOAT, 0, left_half);
-  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-  /* GREEN, right half, under the full-screen viewport */
-  glViewport(0, 0, SCREEN_W, SCREEN_H);
-  glColor4f(0.0f, 1.0f, 0.0f, 1.0f);
-  glVertexPointer(3, GL_FLOAT, 0, right_half);
-  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-  /* Three textured bands, same geometry and the same texture the game draws
-     the scene with, each changing exactly one thing:
-       A (top)    no blending
-       B (middle) the game's blend, texture matrix left as the game set it
-       C (bottom) the game's blend, texture matrix forced to identity
-     Whichever bands vanish name the culprit. */
-  static const GLfloat uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
-  static const GLfloat band_a[] = {0, 200, 254, 480, 200, 254,
-                                   0, 235, 254, 480, 235, 254};
-  static const GLfloat band_b[] = {0, 240, 254, 480, 240, 254,
-                                   0, 275, 254, 480, 275, 254};
-  static const GLfloat band_c[] = {0, 280, 254, 480, 280, 254,
-                                   0, 315, 254, 480, 315, 254};
-
-  /* Replay the captured scene draw, verbatim, in the top-left quarter. */
-  if (scene_draw.valid) {
-    glViewport(0, 0, SCREEN_W / 2, SCREEN_H / 2);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, scene_draw.texture);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glTexCoordPointer(scene_draw.tsize, scene_draw.ttype, scene_draw.tstride,
-                      scene_draw.tptr);
-    if (scene_draw.colour_array) {
-      glEnableClientState(GL_COLOR_ARRAY);
-      glColorPointer(scene_draw.csize, scene_draw.ctype, scene_draw.cstride,
-                     scene_draw.cptr);
-    }
-    glVertexPointer(scene_draw.vsize, scene_draw.vtype, scene_draw.vstride,
-                    scene_draw.vptr);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableClientState(GL_COLOR_ARRAY);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisable(GL_TEXTURE_2D);
-    scene_draw.valid = 0;
-  }
-
-  if (probe_texture) {
-    glViewport(0, 0, SCREEN_W, SCREEN_H);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, probe_texture);
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-    glTexCoordPointer(2, GL_FLOAT, 0, uv);
-    glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-
-    glDisable(GL_BLEND);
-    glVertexPointer(3, GL_FLOAT, 0, band_a);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glVertexPointer(3, GL_FLOAT, 0, band_b);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-    /* Band C now tests the one thing left: a GL_UNSIGNED_BYTE per-vertex
-       colour array, which is what every scene draw uses and the only state
-       my earlier probes did not reproduce. Same white opaque values the game
-       supplies. */
-    static const unsigned char white[] = {255, 255, 255, 255, 255, 255, 255,
-                                          255, 255, 255, 255, 255, 255, 255,
-                                          255, 255};
-    glEnableClientState(GL_COLOR_ARRAY);
-    glColorPointer(4, GL_UNSIGNED_BYTE, 0, white);
-    glVertexPointer(3, GL_FLOAT, 0, band_c);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glDisableClientState(GL_COLOR_ARRAY);
-
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisable(GL_TEXTURE_2D);
-  }
-}
-
-static void probe_pixel(const char *what, int x, int y) {
-  unsigned char px[4] = {0, 0, 0, 0};
-  glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-  trace("[px] %s (%d,%d) = %d,%d,%d,%d\n", what, x, y, px[0], px[1], px[2],
-        px[3]);
-}
-#endif /* FF6_DEBUG */
-
 static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
 #ifdef FF6_DEBUG
   gl_stats_report();
-
-  /* Read the game's own output before covering it with the probe, then the
-     probe itself, so one run answers both questions without needing eyes. */
-  static unsigned swaps;
-  swaps++;
-  int sample = (swaps == 100 || swaps == 600);
-  if (sample) {
-    probe_pixel("game centre", SCREEN_W / 2, SCREEN_H / 2);
-    probe_pixel("game left", 200, SCREEN_H / 2);
-    probe_pixel("panel area", 30, SCREEN_H / 2);
-  }
-
-  /* Probe overlay off: it covers the game's own output. Re-enable to compare
-   * end-of-frame drawing against the game's mid-frame draws. */
-  if (0)
-    draw_viewport_probe();
-
-  /* Scene-split experiment: draw RED, force a gxm scene split (glFlush ends
-     and restarts the scene exactly like any mid-frame reset), draw GREEN.
-     If only GREEN survives to the screen, a mid-frame split discards every
-     draw before it -- which is precisely the game's symptom if something
-     splits the scene between its scene draws and its panel draws. */
-  if (0) {
-    static const GLfloat left_half[] = {0, 0, 254, 240, 0, 254,
-                                        0, 320, 254, 240, 320, 254};
-    static const GLfloat right_half[] = {240, 0,   254, 480, 0,   254,
-                                         240, 320, 254, 480, 320, 254};
-    glDisable(GL_TEXTURE_2D);
-    glDisable(GL_BLEND);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrthof(0.0f, 480.0f, 320.0f, 0.0f, 0.0f, -255.0f);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
-    glViewport(0, 0, SCREEN_W, SCREEN_H);
-
-    glColor4f(1.0f, 0.0f, 0.0f, 1.0f);
-    glVertexPointer(3, GL_FLOAT, 0, left_half);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-    glFlush();
-
-    glColor4f(0.0f, 1.0f, 0.0f, 1.0f);
-    glVertexPointer(3, GL_FLOAT, 0, right_half);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-  }
-
-  if (sample) {
-    probe_pixel("probe RED  (offset vp)", 300, SCREEN_H / 2);
-    probe_pixel("probe GREEN(full vp)", 700, SCREEN_H / 2);
-    probe_pixel("probe TEXTURED", 480, 40);
-  }
 #endif /* FF6_DEBUG */
 
   /* The IME dialog has to be composited by the Vita's own display stack, so we
@@ -1693,31 +1454,14 @@ static unsigned fake_eglSwapBuffers(void *dpy, void *surface) {
   /* If the frame never switched to the panels' viewport the world is still in
    * the offscreen buffer; put it on screen before presenting. */
   present_scene_fbo();
+  present_postfx();
 
   vglSwapBuffers(isInputDialogOpen() ? GL_TRUE : GL_FALSE);
 
-  /* Redirect the next frame's world into the offscreen buffer. This has to
-   * happen here, between frames: vitaGL only picks up a render target change
-   * when it starts a scene, so binding once drawing is under way is ignored
-   * and the world ends up on the display anyway. */
+  /* Re-arm capture; the next world viewport, not the next full-screen UI
+   * pass, starts the offscreen scene. */
   bind_scene_fbo();
-
-#ifdef FF6_DEBUG
-  /* Freeze exactly once, right after presenting a frame whose scene phase
-     drew a bright opaque quad. Whatever is on screen during this pause IS
-     that frame -- the screenshot can no longer sample the wrong moment. */
-  {
-    static int frozen;
-    if (frame_has_bright_scene_draw && !frozen && swaps > 600) {
-      frozen = 1;
-      trace("[freeze] frame %u presented with a bright opaque scene draw; "
-            "holding 15s\n",
-            swaps);
-      sceKernelDelayThread(15 * 1000 * 1000);
-    }
-    frame_has_bright_scene_draw = 0;
-  }
-#endif
+  begin_postfx();
   return 1;
 }
 
@@ -2088,6 +1832,8 @@ static void glMatrixModeHook(GLenum mode) {
 }
 
 static void glGetIntegervHook(GLenum pname, GLint *params) {
+  if (pname == GL_SCISSOR_BOX && params && get_scene_scissor(params))
+    return;
   if (pname == GL_MATRIX_MODE && params) {
     *params = gl_matrix_mode;
     return;
@@ -2131,7 +1877,6 @@ static struct {
 static unsigned sub_ring_pos, redundant_subs_window;
 
 
-extern GLuint probe_texture;
 static GLfloat gl_cur_colour[4] = {1, 1, 1, 1};
 
 /* Log exactly what the .so asks for, so a bad softfp hand-off can be told
@@ -2470,40 +2215,6 @@ static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
   uint32_t splits_before = vgl_debug_scene_splits;
   gl_stats.draws++;
   gl_stats.draws_this_frame++;
-  /* Flag frames whose scene phase draws something that cannot be invisible:
-     bright texture, opaque per-vertex colours, GL_FLOAT scene path. */
-  if (gl_vtx.type == GL_FLOAT && gl_bound_texture < TEX_TRACK &&
-      tex_info[gl_bound_texture].bright && glIsEnabled(GL_COLOR_ARRAY) &&
-      gl_col.type == GL_UNSIGNED_BYTE && gl_col.ptr &&
-      ((const unsigned char *)gl_col.ptr)[3] == 255)
-    frame_has_bright_scene_draw = 1;
-
-  if (gl_vtx.type == GL_FLOAT && gl_bound_texture) {
-    probe_texture = gl_bound_texture;
-    if (!scene_draw.valid) {
-      scene_draw.valid = 1;
-      scene_draw.texture = gl_bound_texture;
-      scene_draw.vsize = gl_vtx.size;
-      scene_draw.vtype = gl_vtx.type;
-      scene_draw.vstride = gl_vtx.stride;
-      scene_draw.tsize = gl_tex.size;
-      scene_draw.ttype = gl_tex.type;
-      scene_draw.tstride = gl_tex.stride;
-      scene_draw.csize = gl_col.size;
-      scene_draw.ctype = gl_col.type;
-      scene_draw.cstride = gl_col.stride;
-      scene_draw.colour_array = glIsEnabled(GL_COLOR_ARRAY);
-      if (gl_vtx.ptr)
-        memcpy(scene_draw.vdata, gl_vtx.ptr, sizeof(scene_draw.vdata));
-      if (gl_tex.ptr)
-        memcpy(scene_draw.tdata, gl_tex.ptr, sizeof(scene_draw.tdata));
-      if (gl_col.ptr)
-        memcpy(scene_draw.cdata, gl_col.ptr, sizeof(scene_draw.cdata));
-      scene_draw.vptr = scene_draw.vdata;
-      scene_draw.tptr = scene_draw.tdata;
-      scene_draw.cptr = scene_draw.cdata;
-    }
-  }
 
   /* Dump one settled frame's worth of draw calls: which texture, how many
      vertices. That is enough to tell a UI overlay from a real scene. */
@@ -2695,41 +2406,6 @@ static void glClearHook(GLbitfield mask) {
  * integer scaling derives the pixel grid from it. */
 static int ortho_base_w = 0;
 static int ortho_base_h = 0;
-
-/* Snap a viewport to a whole multiple of the composition space, centred on the
- * rectangle the engine asked for. At 480x320 into 816x544 the engine's own
- * scale is 1.7x, so a source pixel lands on either one or two screen pixels
- * depending on where it falls -- with GL_NEAREST that is visible as uneven,
- * shimmering pixel sizes. Dropping to the largest whole multiple that fits
- * trades screen area for a uniform grid. */
-static int integer_scale_viewport(GLint *x, GLint *y, GLsizei *w, GLsizei *h) {
-  if (!options.integer_scale || ortho_base_w <= 0 || ortho_base_h <= 0)
-    return 0;
-
-  /* Only the world. The side panels are laid out in screen coordinates under a
-   * full-screen viewport, and shrinking that one too dragged the clock and the
-   * battery inside the game area instead of leaving them at the edges. */
-  if (*w >= SCREEN_W && *h >= SCREEN_H)
-    return 0;
-
-  int scale = *w / ortho_base_w;
-  int scale_y = *h / ortho_base_h;
-  if (scale_y < scale)
-    scale = scale_y;
-  if (scale < 1)
-    return 0;
-
-  GLsizei sw = (GLsizei)(ortho_base_w * scale);
-  GLsizei sh = (GLsizei)(ortho_base_h * scale);
-  if (sw == *w && sh == *h)
-    return 0; /* already exact */
-
-  *x += (*w - sw) / 2;
-  *y += (*h - sh) / 2;
-  *w = sw;
-  *h = sh;
-  return 1;
-}
 
 /* ==========================================================================
  * Paletted textures
@@ -2944,176 +2620,8 @@ static void glCompressedTexImage2DHook(GLenum target, GLint level,
  * display and stay pixel exact.
  * ======================================================================== */
 
-static GLuint scene_fbo = 0;
-static GLuint scene_tex = 0;
-static GLuint scene_depth = 0;
-static int scene_w = 0;
-static int scene_h = 0;
-static int scene_bound = 0;
-static GLint scene_rect[4]; /* where on screen the buffer has to land */
-
-static int scene_fbo_wanted(void) {
-  return options.offscreen && ortho_base_w > 0 && ortho_base_h > 0;
-}
-
-static int ensure_scene_fbo(void) {
-  if (scene_fbo && scene_w == ortho_base_w && scene_h == ortho_base_h)
-    return 1;
-
-  if (scene_fbo) {
-    glDeleteFramebuffers(1, &scene_fbo);
-    glDeleteTextures(1, &scene_tex);
-    glDeleteRenderbuffers(1, &scene_depth);
-    scene_fbo = scene_tex = scene_depth = 0;
-  }
-
-  glGenTextures(1, &scene_tex);
-  bind_texture_2d(scene_tex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ortho_base_w, ortho_base_h, 0,
-               GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-  /* The one surface that genuinely wants filtering. */
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-  /* Battles are the only path that uses depth, and dropping it here would
-   * break exactly the scene this buffer holds. */
-  glGenRenderbuffers(1, &scene_depth);
-  glBindRenderbuffer(GL_RENDERBUFFER, scene_depth);
-  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, ortho_base_w,
-                        ortho_base_h);
-
-  glGenFramebuffers(1, &scene_fbo);
-  glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
-  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-                         scene_tex, 0);
-  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
-                            GL_RENDERBUFFER, scene_depth);
-
-  GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-  if (status != GL_FRAMEBUFFER_COMPLETE) {
-    trace("[fbo] incomplete (0x%x); drawing straight to the display\n", status);
-    glDeleteFramebuffers(1, &scene_fbo);
-    glDeleteTextures(1, &scene_tex);
-    glDeleteRenderbuffers(1, &scene_depth);
-    scene_fbo = scene_tex = scene_depth = 0;
-    return 0;
-  }
-
-  scene_w = ortho_base_w;
-  scene_h = ortho_base_h;
-  trace("[fbo] world buffer %dx%d\n", scene_w, scene_h);
-  return 1;
-}
-
-/* Start a frame with the world redirected into the buffer. Called between
- * frames so vitaGL picks the render target up when it opens the scene. */
-static void bind_scene_fbo(void) {
-  if (!scene_fbo_wanted() || !ensure_scene_fbo())
-    return;
-
-  glBindFramebuffer(GL_FRAMEBUFFER, scene_fbo);
-  scene_bound = 1;
-#ifdef FF6_DEBUG
-  {
-    static int n;
-    if (n < 3) { n++; trace("[fbo] bind fbo=%u tex=%u\n", scene_fbo, scene_tex); }
-  }
-#endif
-  glViewport(0, 0, scene_w, scene_h);
-  /* The engine clears the display, never this buffer. */
-  glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-}
-
-/* Put the offscreen world on screen in the rectangle the engine asked for.
- * Everything this touches is saved and restored: the engine is mid-frame and
- * expects its own state back. */
-static void present_scene_fbo(void) {
-  if (!scene_bound)
-    return;
-  scene_bound = 0;
-
-  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-  glViewport(scene_rect[0], scene_rect[1], scene_rect[2], scene_rect[3]);
-
-  GLboolean had_blend = glIsEnabled(GL_BLEND);
-  GLboolean had_depth = glIsEnabled(GL_DEPTH_TEST);
-  GLboolean had_alpha = glIsEnabled(GL_ALPHA_TEST);
-  GLboolean had_cull = glIsEnabled(GL_CULL_FACE);
-  GLboolean had_col = glIsEnabled(GL_COLOR_ARRAY);
-  GLboolean had_tca = glIsEnabled(GL_TEXTURE_COORD_ARRAY);
-  GLboolean had_tex2d = glIsEnabled(GL_TEXTURE_2D);
-
-  glDisable(GL_BLEND);
-  glDisable(GL_DEPTH_TEST);
-  glDisable(GL_ALPHA_TEST);
-  glDisable(GL_CULL_FACE);
-  glDisableClientState(GL_COLOR_ARRAY);
-
-  /* The engine can leave the active unit elsewhere, and a texture matrix on
-   * unit 0 would move these coordinates. Pin both. */
-  glActiveTexture(GL_TEXTURE0);
-  glMatrixMode(GL_TEXTURE);
-  glPushMatrix();
-  glLoadIdentity();
-  /* Clip space directly, with both matrices identity: the quad then cannot be
-   * bent by whatever projection the engine had set. */
-  glMatrixMode(GL_PROJECTION);
-  glPushMatrix();
-  glLoadIdentity();
-  glMatrixMode(GL_MODELVIEW);
-  glPushMatrix();
-  glLoadIdentity();
-
-  glEnable(GL_TEXTURE_2D);
-  bind_texture_2d(scene_tex);
-  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
-  glColor4f(1.0f, 1.0f, 1.0f, 1.0f);
-
-  static const GLfloat quad[] = {-1, -1, 0, 1, -1, 0, -1, 1, 0, 1, 1, 0};
-  static const GLfloat uv[] = {0, 0, 1, 0, 0, 1, 1, 1};
-
-  glEnableClientState(GL_VERTEX_ARRAY);
-  glEnableClientState(GL_TEXTURE_COORD_ARRAY);
-  glVertexPointer(3, GL_FLOAT, 0, quad);
-  glTexCoordPointer(2, GL_FLOAT, 0, uv);
-  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-#ifdef FF6_DEBUG
-  {
-    static int n;
-    if (n < 3) { n++; trace("[fbo] blit tex=%u a (%d,%d %dx%d)\n", scene_tex,
-                            scene_rect[0], scene_rect[1], scene_rect[2], scene_rect[3]); }
-  }
-#endif
-
-  glMatrixMode(GL_PROJECTION);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
-  glPopMatrix();
-  glMatrixMode(GL_TEXTURE);
-  glPopMatrix();
-  glMatrixMode(GL_MODELVIEW);
-
-  glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
-  if (!had_tex2d)
-    glDisable(GL_TEXTURE_2D);
-  if (!had_tca)
-    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
-  if (had_col)
-    glEnableClientState(GL_COLOR_ARRAY);
-  if (had_blend)
-    glEnable(GL_BLEND);
-  if (had_depth)
-    glEnable(GL_DEPTH_TEST);
-  if (had_alpha)
-    glEnable(GL_ALPHA_TEST);
-  if (had_cull)
-    glEnable(GL_CULL_FACE);
-}
+#include "scene_upscale.hpp"
+#include "postfx.hpp"
 
 /* The engine re-sets the viewport to the value it already has several times a
  * frame. Swallowing the redundant calls costs nothing and keeps a no-op from
@@ -3121,26 +2629,29 @@ static void present_scene_fbo(void) {
 static void glViewportHook(GLint x, GLint y, GLsizei w, GLsizei h) {
   static GLint cur[4] = {-1, -1, -1, -1};
 
-  integer_scale_viewport(&x, &y, &w, &h);
-
   /* A viewport narrower than the screen is the world; a full-screen one is the
    * side panels. Enter the offscreen buffer on the first, leave it on the
    * second. */
   if (scene_fbo_wanted()) {
-    int is_world = (w < SCREEN_W);
+    int is_world = w > 0 && h > 0 && (w < SCREEN_W || h < SCREEN_H);
 
     if (is_world) {
-      /* Remember where this has to end up, then redirect the world into the
-       * buffer. The bind itself happens at the top of the frame -- vitaGL
-       * only honours a render target change between scenes, so binding here
-       * left the world going to the display and the blit painted over it. */
-      scene_rect[0] = x;
-      scene_rect[1] = y;
-      scene_rect[2] = w;
-      scene_rect[3] = h;
+      /* The pinned vitaGL resets its scene on a render-target change. Start
+       * only at the world viewport, not during preceding full-screen UI. */
+      scene_native_rect[0] = x;
+      scene_native_rect[1] = y;
+      scene_native_rect[2] = w;
+      scene_native_rect[3] = h;
+      ff6_display_rect(scene_native_rect, SCREEN_W, SCREEN_H,
+                       options.aspect_ratio, options.integer_scale,
+                       ortho_base_w, ortho_base_h, scene_rect);
+      publish_scene_layout();
+      if (!scene_bound && !scene_presented)
+        start_scene_fbo();
       if (scene_bound) {
         cur[0] = cur[1] = cur[2] = cur[3] = -1;
         glViewport(0, 0, scene_w, scene_h);
+        apply_scene_scissor();
         return;
       }
     }
@@ -3382,6 +2893,23 @@ static void gl_stats_report(void) {
   MARK("eglSwapBuffers");
   gl_stats.frames++;
 
+  /* Observe elapsed time without holding a bright frame for a screenshot.
+   * This includes pacing, CPU work and emulator scheduling; it is not GPU time. */
+  static uint64_t previous_swap_us, max_interval_us;
+  static unsigned gap_logs;
+  const uint64_t now_us = sceKernelGetSystemTimeWide();
+  if (previous_swap_us && now_us >= previous_swap_us) {
+    const uint64_t interval_us = now_us - previous_swap_us;
+    if (interval_us > max_interval_us)
+      max_interval_us = interval_us;
+    if (interval_us >= 250000 && gap_logs < 64) {
+      trace("[frame-gap] frame=%u interval_us=%llu\n", gl_stats.frames,
+            (unsigned long long)interval_us);
+      gap_logs++;
+    }
+  }
+  previous_swap_us = now_us;
+
   /* One-frame aligned capture: dropping ux0:data/ff6/dump.trigger dumps the
      NEXT frame's full GL stream here and arms vitaGL's per-draw logging, so
      the same frame can be correlated with Vita3K's drawlog layer. */
@@ -3436,6 +2964,9 @@ static void gl_stats_report(void) {
         gl_stats.last_viewport[2], gl_stats.last_viewport[3],
         orphan_bytes_window / 60 / 1024, (orphan_copies_window + 30) / 60,
         redundant_subs_window);
+  trace("[frame-time] frame=%u max_interval_us=%llu\n", gl_stats.frames,
+        (unsigned long long)max_interval_us);
+  max_interval_us = 0;
   gl_stats.draws_window = 0;
   gl_stats.binds_window = 0;
   gl_binds_skipped = 0;
@@ -3589,7 +3120,7 @@ static so_default_dynlib default_dynlib[] = {
     {"glPushMatrix", (uintptr_t)&glPushMatrix},
     {"glRotatef", WRAP(glRotatef)},
     {"glScalef", WRAP(glScalef)},
-    {"glScissor", (uintptr_t)&glScissor},
+    {"glScissor", (uintptr_t)&glScissorHook},
     {"glShadeModel", (uintptr_t)&glShadeModel},
     {"glTexCoordPointer", (uintptr_t)&glTexCoordPointerHook},
     {"glTexEnvf", DBG_ALT((uintptr_t)&glTexEnvfHook, WRAP(glTexEnvf))},
@@ -3985,7 +3516,8 @@ static void patch_game(void) {
             (uintptr_t)&drawGlyphHook);
 
 
-  /* No aspect override here. DeviceIsGen5 (.so+0x200098) and SysConfigIsWide
+  /* No engine-camera aspect hook here. The presentation-only aspect_ratio
+   * setting is handled by the compositor. DeviceIsGen5 (.so+0x200098) and SysConfigIsWide
    * (.so+0x20009c) are four bytes apart, and hook_addr writes eight, so
    * patching the first destroys the second and the loader crashes on boot.
    * The default path already picks the largest 3:2 box that fits, which is
@@ -4056,7 +3588,8 @@ static void pump_buttons(void) {
   if (changed) {
     for (size_t i = 0; i < sizeof(button_map) / sizeof(button_map[0]); i++) {
       if (changed & button_map[i].mask)
-        send_key(button_map[i].keycode, (buttons & button_map[i].mask) != 0);
+        send_key(ff6_button_key(button_map[i].keycode, options.swap_buttons),
+                 (buttons & button_map[i].mask) != 0);
     }
     previous = buttons;
   }
@@ -4094,6 +3627,7 @@ static void pump_touch(void) {
       /* The front panel reports 1920x1088; the engine works in screen pixels. */
       event.x[i] = (float)touch.report[i].x * SCREEN_W / 1920.0f;
       event.y[i] = (float)touch.report[i].y * SCREEN_H / 1088.0f;
+      map_scene_touch(&event.x[i], &event.y[i]);
     }
   }
 
@@ -4126,8 +3660,13 @@ static int main_thread(SceSize args, void *argp) {
    * buffer, so vitaGL has to be brought up with one or combats break while the
    * field looks fine. */
   trace("[ff6] vglInitExtended...\n");
-  vglInitExtended(0, SCREEN_W, SCREEN_H,
-                  MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, msaa);
+  if (vglInitExtended(0, SCREEN_W, SCREEN_H,
+                      MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, msaa)) {
+    SCREEN_W = DEF_SCREEN_W;
+    SCREEN_H = DEF_SCREEN_H;
+  }
+  init_postfx();
+  begin_postfx();
 
   /* The AGB compositor streams tile strips into two 1024x2048 atlases it is
    * also drawing from; vitaGL's orphan-on-modify turns each first strip of a
@@ -4247,6 +3786,15 @@ static int main_thread(SceSize args, void *argp) {
         if (autoplay)
           trace("[auto] autoplay armed\n");
       }
+      if (autoplay && ff6_system_mode && *ff6_system_mode == 6) {
+        SceIoStat st;
+        if (sceIoGetstat(DATA_PATH "/autoplay-stop-battle.trigger", &st) >= 0) {
+          send_key(96, 0);
+          send_key(19, 0);
+          autoplay = 0;
+          trace("[auto] stopped at battle mode 6 for menu inspection\n");
+        }
+      }
       if (autoplay) {
         /* Tap confirm to clear dialogue, and walk north the rest of the time:
          * from the Narshe entrance that runs into the guards that start the
@@ -4353,6 +3901,21 @@ int main(int argc, char *argv[]) {
   SceAppUtilInitParam initParam{};
   SceAppUtilBootParam bootParam{};
   sceAppUtilInit(&initParam, &bootParam);
+
+  SceAppUtilAppEventParam eventParam = {};
+  sceAppUtilReceiveAppEvent(&eventParam);
+  char launch_event[2048] = {};
+  if (eventParam.type == 0x05) {
+    sceAppUtilAppEventParseLiveArea(&eventParam, launch_event);
+    launch_event[sizeof(launch_event) - 1] = 0;
+  }
+  bool configure = strstr(launch_event, "-config") != NULL;
+  for (int i = 1; i < argc; ++i)
+    if (argv[i] && !strcmp(argv[i], "-config")) configure = true;
+  if (configure) {
+    int result = sceAppMgrLoadExec("app0:/companion.bin", NULL, NULL);
+    fatal_error("Cannot launch Configurator (0x%x). Reinstall the complete VPK.", result);
+  }
 
   loadOptions();
 

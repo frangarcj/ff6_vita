@@ -228,12 +228,14 @@ static int text_clear_h = 0;
 static float paint_scale = 0.0f;
 static int paint_ascent = 0;
 static int paint_descent = 0;
+static int paint_baseline = 0;
 
 static void update_metrics(void) {
   if (!init_font()) {
     paint_scale = 0.0f;
     paint_ascent = 0;
     paint_descent = 0;
+    paint_baseline = 0;
     return;
   }
 
@@ -242,6 +244,7 @@ static void update_metrics(void) {
   paint_scale = metrics.scale;
   paint_ascent = metrics.ascent;
   paint_descent = metrics.descent;
+  paint_baseline = metrics.baseline;
 }
 
 void setTextColor(int argb) {
@@ -394,7 +397,7 @@ static void rasterize_text(void) {
     stbtt_GetCodepointHMetrics(font_info, codepoint, &advance, &left_bearing);
 
     if (!ff6_raster_glyph(font_info, codepoint, paint_scale,
-                          (int)floorf(pen_x + 0.5f), paint_ascent, coverage,
+                          (int)floorf(pen_x + 0.5f), paint_baseline, coverage,
                           TEXT_IMG_W, height, TEXT_IMG_W))
       trace("[font] unable to rasterize U+%04x\n", codepoint);
 

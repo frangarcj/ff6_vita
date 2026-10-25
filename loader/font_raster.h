@@ -11,6 +11,7 @@ typedef struct {
   float scale;
   int ascent;
   int descent;
+  int baseline;
 } ff6_font_metrics;
 
 /* Paint.setTextSize is an EM size, not the font's ascent/descent line box.
@@ -19,7 +20,7 @@ typedef struct {
 static inline ff6_font_metrics ff6_measure_font(const stbtt_fontinfo *font,
                                                int size, int percent,
                                                int max_height) {
-  ff6_font_metrics result = {0.0f, 0, 0};
+  ff6_font_metrics result = {0.0f, 0, 0, 0};
   int ascent, descent, gap;
   if (!font || max_height < 3)
     return result;
@@ -38,6 +39,23 @@ static inline ff6_font_metrics ff6_measure_font(const stbtt_fontinfo *font,
   result.scale = scale;
   result.ascent = (int)ceilf(ascent * scale);
   result.descent = (int)ceilf(-descent * scale);
+  result.baseline = result.ascent;
+  /* Noto's hhea box reserves extra vertical space for the full CJK font.
+   * Keep that upload/layout capacity, but center a stable capital-height
+   * reference inside it. Do not center each word: accents and descenders
+   * must share the same baseline as the surrounding labels and numbers. */
+  int reference = stbtt_FindGlyphIndex(font, 'H');
+  if (reference) {
+    int x0, y0, x1, y1;
+    stbtt_GetGlyphBitmapBox(font, reference, scale, scale, &x0, &y0, &x1, &y1);
+    int height = result.ascent + result.descent;
+    int ink_height = y1 - y0;
+    if (ink_height > 0 && ink_height <= height) {
+      int baseline = (height - ink_height) / 2 - y0;
+      if (baseline >= 0 && baseline <= height)
+        result.baseline = baseline;
+    }
+  }
   return result;
 }
 

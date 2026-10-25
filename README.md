@@ -1,5 +1,7 @@
 # Final Fantasy VI Vita
 
+[![CI](https://github.com/frangarcj/ff6_vita/actions/workflows/compilation.yml/badge.svg)](https://github.com/frangarcj/ff6_vita/actions/workflows/compilation.yml)
+
 This is a wrapper/port of *Final Fantasy VI Android* for the *PS Vita*.
 
 The port works by loading the official Android ARMv7 executable in memory,
@@ -8,13 +10,28 @@ properly run.
 
 ## Current status
 
-The project is being prepared as **1.0.0-rc1**. Fixes for undersized text,
-glyphs discarded at bitmap edges, glyph-atlas upload limits and atlas sampling
-are now implemented and covered by host regressions. The updated release build's
-resume-confirmation menu has been inspected in an isolated emulator run:
-text was readable with no missing letters or overlap observed in that menu.
-Broader dialogue, menu, battle and real-hardware checks remain pending; the
-candidate is not finalized for release.
+The first public GitHub candidate is **v1.0.0-rc1**. Earlier documents labelled
+RC1/RC2 describe local development snapshots, not earlier public releases.
+The follow-up fixes reused glyph cells and vertical text alignment, adds an
+optional sharp-bilinear final upscale, and maps battle-menu clipping into the
+offscreen buffer. Battle/action-menu captures and host regressions cover these
+changes. Obsolete diagnostic freezes and presentation probes have been removed;
+Release builds exclude diagnostic logs, status files and test triggers.
+Broader dialogue, menu, battle and real-hardware checks remain pending; this
+is a release candidate, not stable-release signoff.
+
+### Features
+
+- A **LiveArea Configurator**, with safe configuration saving, language, audio,
+  MSAA, filtering, font scale, resolution and control options.
+- **Swap Cross/Circle**, native/720p/1080i output selection with VitaGL fallback,
+  and optional presentation aspect ratios. FF6 retains its original 2D view;
+  these ratios stretch inside the game area rather than expanding the camera.
+- Seven optional **PostFX** effects adapted from `ff3_vita`: Negative, FXAA,
+  Sepia, Greyscale, CRT, CRT-Bleeding and CRT-Bleeding-Flat. They apply after
+  world scaling and UI composition; sharp-bilinear remains independent.
+- Automated host regressions, VitaSDK builds, package/provenance checks and
+  tag-based GitHub prereleases. See [FF3 parity and limits](docs/FF3_PARITY.md).
 
 Historical July 2026 testing on real Vita hardware confirmed an improvement
 to Narshe scrolling after enabling in-place texture updates. The subsequent
@@ -27,9 +44,9 @@ slots; older investigation notes that call saving broken predate or conflict
 with those changes. No completed save-persistence test is recorded yet.
 
 See [the release checklist](docs/RELEASE_CHECKLIST.md) for the acceptance gates,
-[the 2026-10-25 validation report](docs/VALIDATION_2026-10-25.md) for the bounded
-build, host-test and emulator results, and [HUNT.md](HUNT.md) for the historical
-investigation. Known limitations
+[the RC2 report](docs/RC2_VALIDATION_2026-10-25.md) for the current evidence,
+[the RC1 report](docs/VALIDATION_2026-10-25.md) for earlier checks, and
+[HUNT.md](HUNT.md) for the historical investigation. Known limitations
 include thin seams between tiles and unavailable Google Play services such as
 cloud saves and achievements. Offscreen rendering and native fixed-point
 colors are experimental options and are disabled by default.
@@ -136,7 +153,8 @@ it. The helper above checks SHA-256 for both the executable and the OBB.
    `/sdcard/Android/obb/com.square_enix.android_googleplay.FFVI/`.
 4. Open your APK as an archive and copy `lib/armeabi-v7a/libFF6.so` to
    `ux0:data/ff6/libFF6.so`.
-5. Install `FF6.vpk`. Keep a backup of any existing `RockDat*.sav` files before
+5. Install [FF6.vpk from the release page](https://github.com/frangarcj/ff6_vita/releases/tag/v1.0.0-rc1).
+   Keep a backup of any existing `RockDat*.sav` files before
    testing a candidate or replacing an earlier build.
 
 The final layout should be:
@@ -156,21 +174,44 @@ buttons, Start and Select are forwarded as Android gamepad buttons, and the
 front touchscreen supplies touch input. Use the game's own button settings
 for its action mapping.
 
+### Configurator
+
+Open **Configure** in the game's LiveArea to launch the bundled companion.
+It works without the commercial game files. Navigate with the gamepad, choose
+**Save and launch** (or press **START**) to apply options and start the game.
+Save/exit and discard actions are also available. A failed save is reported
+instead of silently launching; comments and unknown configuration keys are
+preserved. Saved games are never written by the Configurator.
+
+The original 544p, native 3:2 layout remains the default. Higher output modes,
+alternative aspect ratios and PostFX are experimental until checked on your
+hardware. Integer scaling takes precedence over the aspect selection. For the
+sharp-bilinear presentation used in the menu tests, select **Sharp-bilinear
+final scale** and keep **Font scale = 100**.
+
 ### options.cfg
 
-Create this optional file in `ux0:data/ff6`. Use one `key=value` entry per line
-without spaces around `=` and restart the game after changing it. Omitting
+Create this optional file in `ux0:data/ff6`, or use the Configurator. Use one
+`key=value` entry per line and restart the game after changing it. Whitespace
+and `#`/`;` comments are accepted; malformed/out-of-range values use safe
+defaults. Omitting
 the file uses these defaults:
 
 | Key | Default | Accepted settings |
 | --- | --- | --- |
+| `resolution` | `0` | `0` 960x544, `1` 1280x725, `2` 1920x1088; hardware support required, otherwise VitaGL falls back to native |
+| `swap_buttons` | `0` | `1` swaps Cross/Circle confirm/cancel, including key releases |
+| `aspect_ratio` | `0` | `0` native 3:2, `1` 4:3, `2` 16:9, `3` 2:1, `4` 21:9; presentation stretch within the original game area, not a wider field of view |
+| `postfx` | `0` | `0` none, `1` Negative, `2` FXAA, `3` Sepia, `4` Greyscale, `5` CRT, `6` CRT-Bleeding, `7` CRT-Bleeding-Flat |
 | `bilinear` | `0` | `0` nearest for non-atlas textures, `1` linear; registered glyph atlases always use linear sampling |
 | `integerscale` | `0` | `0` fill the normal 3:2 game area, `1` use a whole-number scale |
 | `language` | `0` | `0` system language; explicit values below |
 | `antialiasing` | `2` | `0` off, `1` MSAA 2x, `2` MSAA 4x |
 | `sound` | `1` | `0` disable audio, `1` enable audio |
-| `fontscale` | `100` | Positive percentage of the EM text size requested by the Android engine; semantics changed in this candidate |
+| `fontscale` | `100` | 25..400 percent of the requested EM text size; the Configurator slider offers 25..200 |
 | `inplacetex` | `1` | `1` update atlas textures in place, `0` use vitaGL's normal texture-update path |
+| `sharpbilinear` | `0` | Experimental: `1` enables a low-resolution scene buffer and a sharp-bilinear final upscale; independent of `bilinear` |
+| `offscreen` | `0` | Experimental: `1` enables the scene buffer with ordinary bilinear presentation when `sharpbilinear=0` |
 
 Language overrides are `1` Japanese, `2` English, `4` German, `5` French,
 `6` Italian, `7` Spanish, `8` Simplified Chinese, `9` Traditional Chinese,
@@ -187,8 +228,9 @@ language=7
 ```
 
 The engine uses its normal 3:2 game area: 816x544 within the Vita's 960x544
-display. There is no supported `aspect` option. `bilinear=2` is also not a
-supported filtering mode.
+display. `aspect_ratio` changes only its final presentation and preserves the
+screen-space side panels. `aspect` is not a recognized alias. `bilinear=2`
+is not a supported filtering mode.
 
 #### Filtering
 
@@ -206,16 +248,36 @@ This exception is specific to the glyph atlases. The separate full-string
 `createTextTexture`/`drawText00` path is not classified as an atlas and still
 follows the general `bilinear` override.
 
+Glyph uploads replace the entire atlas cell with transparent padding around
+the new bitmap, so reusing a cell for a narrower or shorter glyph does not
+leave pixels from its previous occupant. A host regression reproduces the
+old stale-cell contents and checks the correction and neighboring cells.
+See the [menu-atlas follow-up](docs/MENU_ATLAS_VALIDATION_2026-10-25.md)
+for the bounded build and emulator evidence; broader menu and hardware
+acceptance remains pending.
+
 `integerscale=1` is the other way to get an even pixel grid: it shrinks the
 game area to the largest whole multiple of 480x320 that fits. On a 544-tall
 panel that is only 1x, giving a centered 480x320 game area. Thin tile seams
 remain a known visual issue; a filtering option is not a verified fix for it.
+Integer and aspect modes enable the scene buffer and inverse-map touch input;
+they do not change the game's logical layout or glyph metrics.
 
-Sharp-bilinear scaling is not implemented. The experimental `offscreen=1`
-path uses ordinary `GL_LINEAR` on its final quad. A future sharp-bilinear
-pass could be placed at the final 1.7x world upscale; it cannot reconstruct
-correct texels if neighboring atlas cells have already bled into the
-composited image. `offscreen` remains experimental and defaults to `0`.
+`sharpbilinear=1` enables an experimental programmable final pass. It renders
+the scene at 480x320, then remaps texture coordinates to match an integer
+nearest prescale followed by a bilinear resize. The 816x544 output uses a
+2x prescale in each direction, without allocating that intermediate image.
+This is not the same as setting `bilinear=1` on the game's textures, nor
+does it reconstruct texels that have already bled inside a game atlas.
+
+The compositor isolates its shader attributes from the engine's fixed-function
+state and converts screen-space UI scissor rectangles into scene-buffer
+coordinates. It restores the original clipping rectangle for display overlays.
+With `offscreen=1` and `sharpbilinear=0`, the same final pass uses ordinary
+bilinear sampling. Both options default to `0` and still need broad menu and
+hardware validation. In Debug builds only, `upscale-status.txt` records the
+selected final filter and dimensions after its first draw; it is not a
+substitute for checking the rendered image. Release does not write that file.
 
 #### Font size and existing configurations
 
@@ -225,6 +287,14 @@ font's entire ascent/descent box fit that size, which reduced the glyphs.
 The current vertical box is the separately rounded scaled ascent plus the
 magnitude of the descent of the bundled Noto font; it is not a claim to
 reproduce Android's default font's exact top/bottom metrics or layout.
+
+The raster baseline is separate from that conservative box. A fixed capital
+`H` reference centers the visual baseline for each font and size, rather than
+letting Noto's extra top space move the letters below their menu icons. It does
+not center each word independently. At sizes 19 and 28 this moves the bitmap
+baseline up two pixels without changing the font scale, advance widths or
+reported height. Coverage tests include ASCII, Spanish accents, descenders and
+sampled Cyrillic/CJK characters in all three bundled fonts.
 
 Existing `fontscale` overrides are not converted automatically. Start with
 `100` and reassess a value chosen for the older build. For the bundled JP
@@ -257,10 +327,18 @@ install the libraries used by `CMakeLists.txt`, including:
   `vglInPlaceTexSubImage`. Follow [deps/README.md](deps/README.md) to build
   upstream commit `c707ff00d9a372f0ba7056b4a4b723f5a00ba880` with the bundled
   FF6 patch. Its required release flags are `NO_DEBUG=1 NO_SPLASHSCREEN=1
-  SHARED_RENDERTARGETS=1`. The patch also provides native `GL_FIXED` color
+  SHARED_RENDERTARGETS=1 ENABLE_LEGACY_PIPELINE=1`. The last flag is required
+  by the Configurator's ImGui backend. The patch also provides native `GL_FIXED` color
   support for the optional `fixedcolor=1` path.
 - [opensles](https://github.com/frangarcj/opensles) --
   `cd libopensles && make install`
+- [imgui-vita](https://github.com/Rinnegatamante/imgui-vita) -- `make install`
+
+The automated source revisions are recorded in `deps/build.lock.json`. In a
+fresh, isolated VitaSDK environment, `python3 tools/build_dependencies.py`
+builds those dependencies under `build_ci/deps` (OpenSL ES and ImGui install
+into that SDK). Do not run it against an SDK whose shared libraries you need
+to preserve. The CI workflow uses the official VitaSDK container, as in FF3.
 
 After preparing that project-local dependency, build the candidate with
 instrumentation disabled:
@@ -278,34 +356,54 @@ and the archive symbol for `vglInPlaceTexSubImage` before building. The pinned
 source/patch recipe has been built with VitaSDK GCC 15.2.0; it does not promise
 identical output bytes across different SDK installations or source paths.
 
-The outputs include `build_release/FF6.vpk` and the matching
-`build_release/FF6.elf`. Retain the ELF to investigate crash dumps from that
+The outputs include `build_release/FF6.vpk`, `build_release/companion.bin` and
+the matching `FF6.elf` / `companion.elf`. Retain both ELFs to investigate crash dumps from that
 exact build. Validate and stage the package with:
 
 ```bash
-python3 tools/check_release.py build_release --output release
+python3 tools/check_release.py build_release --output release/v1.0.0-rc1
 ```
 
 This checks the release build settings, VPK contents and metadata, and stages
-`FF6.vpk`, `FF6.elf`, `manifest.json` and `SHA256SUMS` in `release/`. Package
-validation does not mark the hardware tests complete. Record the tested
+`FF6.vpk`, `FF6.elf`, `companion.elf`, `manifest.json` and `SHA256SUMS` in the selected directory.
+It rejects known diagnostic paths/markers as well as a Debug profile, while
+retaining crash-report symbols in the standalone ELF. Package validation does
+not mark the hardware tests complete. Record the tested
 artifact identity in the release checklist.
 
 Debug builds use a separate directory and `-DFF6_DEBUG=ON`; they enable
 `boot.log`, GL tracing, trigger files and other investigation tools. They also
 require an instrumented vitaGL archive exporting `vgl_debug_log_draws` and
 `vgl_debug_scene_splits`; CMake checks for these when debug mode is selected.
+The swap regression covers both profiles: neither may inject diagnostic waits,
+pixel-readback probes or overlay draws into frame presentation.
 
-LiveArea artwork is optional: drop `icon0.png`, `livearea/contents/bg0.png`,
-`livearea/contents/startup.png` and `livearea/contents/template.xml` into
-`sce_sys/` and they are picked up automatically by the VPK rule.
-Their absence does not invalidate the VPK. Review the presentation separately
-from the runtime acceptance tests.
+The public release checker requires the Configurator, all seven shader pairs,
+license notices and LiveArea resources. Original indexed PNG assets can be
+regenerated with `python3 tools/generate_livearea.py`; no commercial artwork
+is needed for that build step.
+
+### Tests and workflows
+
+Run `python3 tools/run_host_tests.py` without VitaSDK or game data. It compiles
+nine C regression suites with ASan/UBSan and checks frame-presentation order
+and bundle resources. After a cross-build, run
+`python3 tests/test_release_profile.py build_release/FF6.elf` and the same
+command for `companion.elf` to exercise diagnostic rejection.
+
+`CI` builds pushes, pull requests, manual runs and `run_build` dispatches. It
+uses pinned source dependencies and uploads a verified VPK, symbols and
+provenance bundle. `Release` builds version tags, verifies the bundle's commit
+and checksums, and publishes with `gh`. Tags ending in `-rcN` are prereleases,
+not the latest stable release. Existing releases/assets are never overwritten
+by the workflow; fixes require a new version tag. Actions are pinned by commit.
 
 ## Credits
 
 - TheFloW for the initial arm elf loader.
 - Rinnegatamante for vitaGL and fixes.
+- The `ff3_vita` contributors for the Configurator pattern and PostFX sources.
+- Omar Cornut and the Vita ImGui port contributors for the configuration UI.
 
 See [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for
 the project license and bundled third-party notices, including the Noto fonts.
