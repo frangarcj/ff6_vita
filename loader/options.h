@@ -37,7 +37,7 @@ static const ff6_option ff6_options[] = {
   FF6_OPTION("sound", sound, 0, 1, 1),
   FF6_OPTION("fontscale", font_scale, 25, 400, 100),
   FF6_OPTION("offscreen", offscreen, 0, 1, 0),
-  FF6_OPTION("sharpbilinear", sharp_bilinear, 0, 1, 0),
+  FF6_OPTION("sharpbilinear", sharp_bilinear, 0, 1, 1),
   FF6_OPTION("integerscale", integer_scale, 0, 1, 0),
   FF6_OPTION("fixedcolor", fixed_color_native, 0, 1, 0),
   FF6_OPTION("inplacetex", inplace_tex, 0, 1, 1),

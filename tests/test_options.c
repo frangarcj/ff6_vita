@@ -19,6 +19,7 @@ int main(void) {
   assert(ff6_load_options(path, &a) == 0);
   assert(a.res == 0 && a.postfx == 0 && a.msaa == 2 && a.font_scale == 100);
   assert(a.sound && a.inplace_tex && !a.swap_buttons && !a.aspect_ratio);
+  assert(a.sharp_bilinear == 1);
   write_text(path, "# my settings\r\nnew_future_key=87\nresolution=2\npostfx=7\n"
     "language=7\nswap_buttons=1\nfontscale=69\nsharpbilinear=1\n"
     "antialiasing=-1\nsound=999999999999999999999999999999\n"

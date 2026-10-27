@@ -752,6 +752,14 @@ static int array_pool_next = 0;
 
 static void DeleteLocalRef(void *env, void *localRef) {}
 
+/* SQEXHelpUrl (the title screen's "?" icon) pins its Java helper with
+ * NewGlobalRef and drops it with DeleteGlobalRef when the title logo is torn
+ * down. Handles here are plain tokens that are never reclaimed, so a global
+ * ref is the same value and deleting it is a no-op. Leaving the slots empty
+ * made Exit() call through a NULL pointer. */
+static void *NewGlobalRef(void *env, void *obj) { return obj; }
+static void DeleteGlobalRef(void *env, void *globalRef) {}
+
 static void *FindClass(void) { return (void *)0x41414141; }
 static void *GetObjectClass(void *env, void *obj) { return (void *)0x41414141; }
 
@@ -1077,6 +1085,8 @@ static void InitJNIEnv(void) {
 
   *(uintptr_t *)(fake_env + 0x00) = (uintptr_t)fake_env;
   *(uintptr_t *)(fake_env + 0x18) = (uintptr_t)FindClass;
+  *(uintptr_t *)(fake_env + 0x54) = (uintptr_t)NewGlobalRef;
+  *(uintptr_t *)(fake_env + 0x58) = (uintptr_t)DeleteGlobalRef;
   *(uintptr_t *)(fake_env + 0x5C) = (uintptr_t)DeleteLocalRef;
   *(uintptr_t *)(fake_env + 0x74) = (uintptr_t)NewObjectV;
   *(uintptr_t *)(fake_env + 0x7C) = (uintptr_t)GetObjectClass;
