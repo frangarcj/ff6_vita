@@ -111,7 +111,12 @@ config_opts options;
 static so_module ff6_mod;
 
 int _newlib_heap_size_user = MEMORY_NEWLIB_MB * 1024 * 1024;
-int _opensles_user_freq = 44100;
+/* libOpenSLES opens the Vita audio port at this rate and plays the queued
+ * buffers on it as they are, with no resampling. SoundSystem::Initialize
+ * starts the engine's mixer at 32000 Hz, so any other rate here plays the
+ * music faster and higher (44100 is 1.38x) and makes the port drain the queue
+ * faster than the mixer fills it. */
+int _opensles_user_freq = 32000;
 
 extern "C" {
 void *__wrap_memcpy(void *dest, const void *src, size_t n) {
