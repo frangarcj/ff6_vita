@@ -54,6 +54,7 @@ extern "C" {
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -211,6 +212,70 @@ static int fflush_hook(FILE *stream) {
   if (!stream || is_fake_stdio(stream))
     return 0;
   return fflush(stream);
+}
+
+static int vfprintf_hook(FILE *stream, const char *fmt, va_list list) {
+  if (is_fake_stdio(stream)) {
+    char string[512];
+    int ret = vsnprintf(string, sizeof(string), fmt, list);
+    trace("[stdio] %s", string);
+    return ret;
+  }
+  return vfprintf(stream, fmt, list);
+}
+
+static int ferror_hook(FILE *stream) {
+  return is_fake_stdio(stream) ? 0 : ferror(stream);
+}
+
+/* The 2.1.7 build is linked with a newer NDK, whose compiler emits calls to
+ * the ARM EABI memory helpers instead of inlining them. Their argument order
+ * differs from memset's: (dest, n, c). */
+extern "C" {
+static void *aeabi_memcpy(void *dst, const void *src, size_t n) {
+  return memcpy(dst, src, n);
+}
+static void *aeabi_memmove(void *dst, const void *src, size_t n) {
+  return memmove(dst, src, n);
+}
+static void *aeabi_memset(void *dst, size_t n, int c) {
+  return memset(dst, c, n);
+}
+static void *aeabi_memclr(void *dst, size_t n) { return memset(dst, 0, n); }
+}
+
+static int posix_memalign_fake(void **out, size_t align, size_t size) {
+  void *p = memalign(align, size);
+  if (!p)
+    return 12; /* ENOMEM */
+  *out = p;
+  return 0;
+}
+
+static void sincos_double(double x, double *s, double *c) {
+  *s = sin(x);
+  *c = cos(x);
+}
+
+static void sincos_float(float x, float *s, float *c) {
+  *s = sinf(x);
+  *c = cosf(x);
+}
+
+/* Bionic's pthread_once_t is a plain int (0 = not run); newlib's is a
+ * two-word struct, so passing it through would scribble past the .so's
+ * 4-byte control word. 0 = pending, 1 = running, 2 = done. */
+static int pthread_once_fake(volatile int *once, void (*routine)(void)) {
+  int expected = 0;
+  if (__atomic_compare_exchange_n(once, &expected, 1, 0, __ATOMIC_ACQ_REL,
+                                  __ATOMIC_ACQUIRE)) {
+    routine();
+    __atomic_store_n(once, 2, __ATOMIC_RELEASE);
+  } else {
+    while (__atomic_load_n(once, __ATOMIC_ACQUIRE) != 2)
+      sceKernelDelayThread(100);
+  }
+  return 0;
 }
 
 /* Own sleep primitives rather than newlib's: its usleep is a thin wrapper that
@@ -1090,9 +1155,18 @@ static void InitJNIEnv(void) {
 
   *(uintptr_t *)(fake_env + 0x00) = (uintptr_t)fake_env;
   *(uintptr_t *)(fake_env + 0x18) = (uintptr_t)FindClass;
+  /* Exception state and local-frame bookkeeping: the 2.1.7 engine checks
+   * these around its Java calls, and there is nothing to report or free. */
+  *(uintptr_t *)(fake_env + 0x3C) = (uintptr_t)retNULL; /* ExceptionOccurred */
+  *(uintptr_t *)(fake_env + 0x40) = (uintptr_t)ret0;    /* ExceptionDescribe */
+  *(uintptr_t *)(fake_env + 0x44) = (uintptr_t)ret0;    /* ExceptionClear */
+  *(uintptr_t *)(fake_env + 0x4C) = (uintptr_t)ret0;    /* PushLocalFrame */
+  *(uintptr_t *)(fake_env + 0x50) = (uintptr_t)retNULL; /* PopLocalFrame */
   *(uintptr_t *)(fake_env + 0x54) = (uintptr_t)NewGlobalRef;
   *(uintptr_t *)(fake_env + 0x58) = (uintptr_t)DeleteGlobalRef;
   *(uintptr_t *)(fake_env + 0x5C) = (uintptr_t)DeleteLocalRef;
+  *(uintptr_t *)(fake_env + 0x64) = (uintptr_t)NewGlobalRef; /* NewLocalRef */
+  *(uintptr_t *)(fake_env + 0x68) = (uintptr_t)ret0; /* EnsureLocalCapacity */
   *(uintptr_t *)(fake_env + 0x74) = (uintptr_t)NewObjectV;
   *(uintptr_t *)(fake_env + 0x7C) = (uintptr_t)GetObjectClass;
   *(uintptr_t *)(fake_env + 0x84) = (uintptr_t)GetMethodID;
@@ -1136,6 +1210,7 @@ static void InitJNIEnv(void) {
   *(uintptr_t *)(fake_env + 0x30C) = (uintptr_t)ReleaseIntArrayElements;
   *(uintptr_t *)(fake_env + 0x340) = (uintptr_t)SetByteArrayRegion;
   *(uintptr_t *)(fake_env + 0x374) = (uintptr_t)GetStringUTFRegion;
+  *(uintptr_t *)(fake_env + 0x390) = (uintptr_t)ret0; /* ExceptionCheck */
 }
 
 /* JavaVM: Rock::ObbFile::SetObbFilePath attaches and detaches around its call
@@ -1199,6 +1274,15 @@ typedef struct {
 static fake_native_activity g_activity;
 static fake_android_app g_android_app;
 
+typedef struct {
+  const char *android_version;
+  unsigned int size;
+  unsigned int crc32;
+} ff6_build;
+
+static const ff6_build ff6_builds[] = {FF6_SUPPORTED_BUILDS};
+static const ff6_build *ff6_active_build = NULL;
+
 /* Offsets into libFF6.so's `g_app` engine struct, recovered from
  * initDisplay / GetViewPort / initGame. */
 #define ENGINE_APP 0
@@ -1206,6 +1290,11 @@ static fake_android_app g_android_app;
 #define ENGINE_RENDER_H 28
 #define ENGINE_SCREEN_W 32
 #define ENGINE_SCREEN_H 36
+/* 2.1.7 only: the Java side reports the display cutout here through
+ * callScreenSafeSize(). updateScreenSize() widens the 3:2 view by 10% when
+ * screen - left - right exceeds that width. */
+#define ENGINE_SAFE_LEFT 48
+#define ENGINE_SAFE_RIGHT 52
 
 static uint8_t *g_app = NULL;
 
@@ -3021,6 +3110,9 @@ static void gl_stats_report(void) {
  * ======================================================================== */
 
 extern "C" {
+/* Hidden by the strict -std used for this file, but present in newlib. */
+void *memalign(size_t, size_t);
+int vasprintf(char **, const char *, va_list);
 extern void *__aeabi_atexit;
 extern void *__cxa_atexit;
 extern void *__cxa_finalize;
@@ -3134,6 +3226,7 @@ static so_default_dynlib default_dynlib[] = {
     {"glPopMatrix", (uintptr_t)&glPopMatrix},
     {"glPushMatrix", (uintptr_t)&glPushMatrix},
     {"glRotatef", WRAP(glRotatef)},
+    {"glPixelStorei", (uintptr_t)&glPixelStorei},
     {"glScalef", WRAP(glScalef)},
     {"glScissor", (uintptr_t)&glScissorHook},
     {"glShadeModel", (uintptr_t)&glShadeModel},
@@ -3159,12 +3252,25 @@ static so_default_dynlib default_dynlib[] = {
     {"deflateReset", (uintptr_t)&deflateReset},
     {"inflate", (uintptr_t)&inflate},
     {"inflateEnd", (uintptr_t)&inflateEnd},
+    {"inflateReset2", (uintptr_t)&inflateReset2},
     {"inflateInit2_", (uintptr_t)&inflateInit2_},
     {"inflateInit_", (uintptr_t)&inflateInit_},
     {"inflateReset", (uintptr_t)&inflateReset},
 
     /* runtime support */
     {"__aeabi_atexit", (uintptr_t)&__aeabi_atexit},
+    {"__aeabi_memclr", (uintptr_t)&aeabi_memclr},
+    {"__aeabi_memclr4", (uintptr_t)&aeabi_memclr},
+    {"__aeabi_memclr8", (uintptr_t)&aeabi_memclr},
+    {"__aeabi_memcpy", (uintptr_t)&aeabi_memcpy},
+    {"__aeabi_memcpy4", (uintptr_t)&aeabi_memcpy},
+    {"__aeabi_memcpy8", (uintptr_t)&aeabi_memcpy},
+    {"__aeabi_memmove", (uintptr_t)&aeabi_memmove},
+    {"__aeabi_memmove4", (uintptr_t)&aeabi_memmove},
+    {"__aeabi_memmove8", (uintptr_t)&aeabi_memmove},
+    {"__aeabi_memset", (uintptr_t)&aeabi_memset},
+    {"__aeabi_memset4", (uintptr_t)&aeabi_memset},
+    {"__aeabi_memset8", (uintptr_t)&aeabi_memset},
     {"__android_log_print", (uintptr_t)&__android_log_print},
     {"__assert2", (uintptr_t)&__assert2},
     {"__cxa_atexit", (uintptr_t)&__cxa_atexit},
@@ -3180,6 +3286,7 @@ static so_default_dynlib default_dynlib[] = {
     {"abort", (uintptr_t)&abort},
     {"acosf", WRAP(acosf)},
     {"atan2f", WRAP(atan2f)},
+    {"atof", WRAP((double (*)(const char *))atof)},
     {"atoi", (uintptr_t)&atoi},
     {"calloc", (uintptr_t)&calloc},
     {"ceilf", WRAP(ceilf)},
@@ -3194,12 +3301,26 @@ static so_default_dynlib default_dynlib[] = {
     {"dlsym", (uintptr_t)&retNULL},
     {"fclose", (uintptr_t)&fclose},
     {"feof", (uintptr_t)&feof},
+    {"ferror", (uintptr_t)&ferror_hook},
     {"fflush", (uintptr_t)&fflush_hook},
     {"floor", WRAP((double (*)(double))floor)},
     {"fopen", DBG_ALT((uintptr_t)&fopen_mark, (uintptr_t)&fopen_fake)},
     {"fprintf", (uintptr_t)&fprintf_hook},
     {"fputc", (uintptr_t)&fputc_hook},
     {"fread", DBG_ALT((uintptr_t)&fread_mark, (uintptr_t)&fread)},
+    {"dladdr", (uintptr_t)&ret0},
+    {"isxdigit", (uintptr_t)&isxdigit},
+    {"islower", (uintptr_t)&islower},
+    {"ldexpf", WRAP((float (*)(float, int))ldexpf)},
+    {"localtime", (uintptr_t)&localtime},
+    {"posix_memalign", (uintptr_t)&posix_memalign_fake},
+    {"pthread_once", (uintptr_t)&pthread_once_fake},
+    {"rand", (uintptr_t)&rand},
+    {"srand", (uintptr_t)&srand},
+    {"sincos", WRAP(sincos_double)},
+    {"sincosf", WRAP(sincos_float)},
+    {"vasprintf", (uintptr_t)&vasprintf},
+    {"vfprintf", (uintptr_t)&vfprintf_hook},
     {"free", (uintptr_t)&free},
     {"frexp", WRAP((double (*)(double, int *))frexp)},
     {"fseek", DBG_ALT((uintptr_t)&fseek_mark, (uintptr_t)&fseek)},
@@ -3726,13 +3847,20 @@ static int main_thread(SceSize args, void *argp) {
    * touch event. */
   *(void **)(g_app + ENGINE_APP) = &g_android_app;
   g_android_app.userData = g_app;
+  /* Keep the original 3:2 view on 2.1.7 instead of its 10% horizontal stretch
+   * by reporting just enough side margin that the stretch never triggers. */
+  if (ff6_active_build && !strcmp(ff6_active_build->android_version, "2.1.7")) {
+    int unit = SCREEN_W / 3 < SCREEN_H / 2 ? SCREEN_W / 3 : SCREEN_H / 2;
+    int excess = SCREEN_W - (int)((float)(unit * 3) * 1.1f);
+    int margin = excess > 0 ? (excess + 1) / 2 : 0;
+    *engine_field(ENGINE_SAFE_LEFT) = margin;
+    *engine_field(ENGINE_SAFE_RIGHT) = margin;
+    trace("[ff6] 2.1.7 safe margins %d/%d (keeps 3:2)\n", margin, margin);
+  }
   /* initDisplay() overwrites these from eglQuerySurface, but anything that
    * peeks at the screen size before then should still see the truth. */
   *engine_field(ENGINE_SCREEN_W) = SCREEN_W;
   *engine_field(ENGINE_SCREEN_H) = SCREEN_H;
-
-  trace("[ff6] got[usleep]=0x%x before initGame\n",
-        *(unsigned int *)(ff6_mod.text_base + 0x1513ef8));
 
   /* initGame() spawns thread_main, which owns EGL/GL and runs AgbMain. */
   trace("[ff6] initGame...\n");
@@ -3880,7 +4008,7 @@ static int file_exists(const char *path) {
   return sceIoGetstat(path, &stat) >= 0;
 }
 
-/* The loader patches private layouts in one known engine build. Refuse a
+/* The loader patches private layouts in known engine builds. Refuse a
  * different or damaged library before even reading its ELF table offsets. */
 static void validate_game_library(void) {
   FILE *file = fopen(SO_PATH, "rb");
@@ -3889,11 +4017,14 @@ static void validate_game_library(void) {
 
   int seek_result = fseek(file, 0, SEEK_END);
   long size = ftell(file);
-  if (seek_result != 0 || size != FF6_SO_SIZE ||
-      fseek(file, 0, SEEK_SET) != 0) {
+  const ff6_build *build = NULL;
+  for (size_t i = 0; i < sizeof(ff6_builds) / sizeof(ff6_builds[0]); i++)
+    if (size == (long)ff6_builds[i].size)
+      build = &ff6_builds[i];
+  if (seek_result != 0 || !build || fseek(file, 0, SEEK_SET) != 0) {
     fclose(file);
     fatal_error("Unsupported or damaged libFF6.so.\nUse the ARMv7 library from "
-                "Final Fantasy VI Android " FF6_ANDROID_VERSION ".");
+                "Final Fantasy VI Android " FF6_ANDROID_VERSIONS ".");
   }
 
   unsigned char buffer[16384];
@@ -3906,10 +4037,12 @@ static void validate_game_library(void) {
   }
   int failed = ferror(file);
   fclose(file);
-  if (failed || total != FF6_SO_SIZE || checksum != FF6_SO_CRC32)
+  if (failed || total != build->size || checksum != build->crc32)
     fatal_error("Unsupported or damaged libFF6.so.\nUse the ARMv7 library from "
-                "Final Fantasy VI Android " FF6_ANDROID_VERSION ".\n"
-                "See the README for the supported file checksum.");
+                "Final Fantasy VI Android " FF6_ANDROID_VERSIONS ".\n"
+                "See the README for the supported file checksums.");
+  ff6_active_build = build;
+  trace("[ff6] libFF6.so is Android %s\n", build->android_version);
 }
 
 int main(int argc, char *argv[]) {

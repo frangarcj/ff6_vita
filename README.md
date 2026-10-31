@@ -24,13 +24,19 @@ A port of *Final Fantasy VI (Android)* for the **PlayStation Vita**, based on th
 
 2. Install `libshacccg.suprx` if you don't have it yet. Follow [this guide](https://samilops2.gitbook.io/vita-troubleshooting-guide/shader-compiler/extract-libshacccg.suprx).
 
-3. Get the **Android 2.1.6** version of Final Fantasy VI from your own legally obtained copy, including its APK and matching OBB. Other versions haven't been verified.
+3. Get the **Android 2.1.6 or 2.1.7** version of Final Fantasy VI from your own legally obtained copy, including its APK and OBB. The port supports both executables (`libFF6.so`) and tells them apart by size and checksum. Both releases use the **same OBB**, so either APK works with the OBB you already have. Other versions haven't been verified.
+
+   | Android version | `libFF6.so` (armeabi-v7a) | `main.obb` |
+   | --- | --- | --- |
+   | 2.1.6 | 22,340,224 bytes | 654,927,616 bytes (shared) |
+   | 2.1.7 | 22,468,868 bytes | 654,927,616 bytes (shared) |
 
 4. Create `ux0:data/ff6` and copy these files into it:
 
    ```text
    ux0:data/ff6/libFF6.so    (from the APK: lib/armeabi-v7a/)
    ux0:data/ff6/main.obb     (the matching Android OBB, renamed)
+   ux0:data/ff6/assets/      (optional, 2.1.7 only: the APK's assets/ folder, for the side frames)
    ```
 
 5. Install **FF6.vpk** on your Vita and launch the game.

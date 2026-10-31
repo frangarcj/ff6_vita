@@ -15,10 +15,11 @@
 #define CONFIG_FILE_PATH DATA_PATH "/" "options.cfg"
 
 /* Private engine layouts and hooks below target the ARMv7 library from the
- * original Android 2.1.6 release. Check it before parsing or patching it. */
-#define FF6_ANDROID_VERSION "2.1.6"
-#define FF6_SO_SIZE 22340224u
-#define FF6_SO_CRC32 0x1441da16u
+ * original Android 2.1.6 and 2.1.7 releases. Check it before parsing or
+ * patching it. Both builds export the symbols the loader resolves by name. */
+#define FF6_ANDROID_VERSIONS "2.1.6 or 2.1.7"
+#define FF6_SUPPORTED_BUILDS                                                   \
+  {"2.1.6", 22340224u, 0x1441da16u}, {"2.1.7", 22468868u, 0x378decdfu}
 
 #define DEF_SCREEN_W 960
 #define DEF_SCREEN_H 544

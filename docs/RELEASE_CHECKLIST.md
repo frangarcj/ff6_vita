@@ -113,9 +113,9 @@ from APK filenames or use a different build's ELF to analyze a crash.
 | Build command and compiler versions | Pinned dependency recipe with Release / `FF6_DEBUG=OFF`, VitaSDK GCC 15.2.0; final compiler versions and executable hashes in the manifest |
 | vitaGL source revision, patches and flags | Upstream `c707ff00d9a372f0ba7056b4a4b723f5a00ba880` plus `deps/vitagl-ff6.patch`; see `deps/vitagl.lock.json` and the preparation recipe |
 | Other linked dependency versions/provenance | Manifest hashes the CMake link command and 38 explicit static archives in the tested build; implicit compiler runtimes and upstream source revisions are not inferred |
-| Android package/versionCode/versionName | `com.square_enix.android_googleplay.FFVI` / `216` / `2.1.6`, verified from the decoded Android manifest |
-| Supported `libFF6.so` | 22,340,224 bytes; SHA-256 `f612f711330238cf405a403fb084abd2b8d7c9e72f9867740aed2b834fc731e6` |
-| Matching `main.obb` | 654,927,616 bytes; SHA-256 `4f443b8d0be0a7976f8dd540cccb24a643937afd6eec043e7bf7d13fe427369f` |
+| Android package/versionCode/versionName | `com.square_enix.android_googleplay.FFVI` / `216` / `2.1.6`, verified from the decoded Android manifest; `21701` / `2.1.7` is also supported (same package) |
+| Supported `libFF6.so` | 2.1.6: 22,340,224 bytes; SHA-256 `f612f711330238cf405a403fb084abd2b8d7c9e72f9867740aed2b834fc731e6` (CRC32 `1441da16`)<br>2.1.7: 22,468,868 bytes; SHA-256 `7cd94bbba3f13987ba1e3f2a3c57db6a1abf360f0ff31a76bac945601a70bcd3` (CRC32 `378decdf`) |
+| Matching `main.obb` (same file for both executables) | 654,927,616 bytes; SHA-256 `4f443b8d0be0a7976f8dd540cccb24a643937afd6eec043e7bf7d13fe427369f` |
 | Tester, date and hardware | Pending device validation |
 | Firmware and plugin versions | Pending device validation |
 | Configuration and clock overrides | Baseline below; record any deviations |
