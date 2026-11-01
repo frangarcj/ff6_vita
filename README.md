@@ -8,7 +8,7 @@
 
 A port of *Final Fantasy VI (Android)* for the **PlayStation Vita**, based on the original ARMv7 game. Like [FF3 Vita](https://github.com/frangarcj/ff3_vita), it loads the Android game files instead of including them in the download. You'll need your own copy of the game.
 
-**Download:** [FF6.vpk (v1.0.0-rc1)](https://github.com/frangarcj/ff6_vita/releases/download/v1.0.0-rc1/FF6.vpk)
+**Download:** [FF6.vpk (v1.0.0)](https://github.com/frangarcj/ff6_vita/releases/download/v1.0.0/FF6.vpk)
 
 ## Installation
 

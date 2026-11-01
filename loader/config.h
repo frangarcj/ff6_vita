@@ -5,7 +5,9 @@
  * contiguous block well away from the newlib heap. */
 #define LOAD_ADDRESS 0x98000000
 
-#define MEMORY_NEWLIB_MB 192
+/* Measured peak 112 MB in battle. Was 192, before the 64 MB asset cache: half of
+ * that comes from here and half from what vitaGL gets. */
+#define MEMORY_NEWLIB_MB 160
 #define MEMORY_VITAGL_THRESHOLD_MB 8
 
 #define DATA_PATH "ux0:data/ff6"
@@ -20,6 +22,10 @@
 #define FF6_ANDROID_VERSIONS "2.1.6 or 2.1.7"
 #define FF6_SUPPORTED_BUILDS                                                   \
   {"2.1.6", 22340224u, 0x1441da16u}, {"2.1.7", 22468868u, 0x378decdfu}
+
+/* Both Android releases share one archive. Checking its contents would mean reading
+ * 655 MB, about a minute on a memory card; a truncated copy shows in the size. */
+#define FF6_OBB_SIZE 654927616LL
 
 #define DEF_SCREEN_W 960
 #define DEF_SCREEN_H 544
@@ -72,6 +78,15 @@ typedef struct {
                       * copy, ~5 MB/frame while the town scrolls. Writing in
                       * place skips that; the strips entering view are not
                       * sampled by the frames still in flight. */
+  int obb_reader;    /* 1 = serve the .obb from loader/obb_file.h: one shared
+                      * descriptor and exact reads. 0 = newlib stdio, which turns
+                      * the engine's reopen-and-seek pattern into many small or
+                      * wasted device reads. */
+  int fast_gzip;     /* 1 = decode the engine's whole-file .gz assets with
+                      * loader/fast_gunzip.h. 0 = zlib. */
+  int asset_cache_mb; /* Memory for decoded assets, loader/asset_cache.h, so that
+                       * reopening a menu or another battle skips reading and
+                       * decoding. Taken from what vitaGL would get. 0 = off. */
 } config_opts;
 
 extern config_opts options;

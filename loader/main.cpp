@@ -62,6 +62,15 @@ extern "C" {
 #include <unistd.h>
 #include <zlib.h>
 
+#include "asset_cache.h"
+#include "fast_gunzip.h"
+#include "obb_file.h"
+#include <psp2/io/stat.h>
+#include <psp2/kernel/modulemgr.h>
+#ifdef FF6_LIBPERF
+#include <libperf.h>
+#endif
+
 extern "C" {
 char *strdup(const char *);
 long lrand48(void);
@@ -185,6 +194,52 @@ static int is_fake_stdio(void *stream) {
          stream < (void *)((char *)__sF_fake + sizeof(__sF_fake));
 }
 
+static int obb_io_open(const char *path) {
+  return sceIoOpen(path, SCE_O_RDONLY, 0);
+}
+static int obb_io_pread(int fd, void *dst, unsigned size, long long offset) {
+  return sceIoPread(fd, dst, size, offset);
+}
+static long long obb_io_size(int fd) {
+  SceIoStat stat;
+  return sceIoGetstatByFd(fd, &stat) < 0 ? -1 : (long long)stat.st_size;
+}
+static void obb_io_close(int fd) { sceIoClose(fd); }
+
+static const ff6_obb_io obb_io = {obb_io_open, obb_io_pread, obb_io_size,
+                                  obb_io_close};
+static ff6_obb_reader obb_reader = {&obb_io, OBB_PATH, 0, 0, -1, 0, {}};
+
+static size_t fread_fake(void *dst, size_t size, size_t count, FILE *stream) {
+  if (ff6_obb_is_handle(&obb_reader, stream))
+    return ff6_obb_read(&obb_reader, (ff6_obb_handle *)stream, dst, size, count);
+  return fread(dst, size, count, stream);
+}
+
+static int fseek_fake(FILE *stream, long offset, int whence) {
+  if (ff6_obb_is_handle(&obb_reader, stream))
+    return ff6_obb_seek(&obb_reader, (ff6_obb_handle *)stream, offset, whence);
+  return fseek(stream, offset, whence);
+}
+
+static long ftell_fake(FILE *stream) {
+  if (ff6_obb_is_handle(&obb_reader, stream))
+    return (long)((ff6_obb_handle *)stream)->pos;
+  return ftell(stream);
+}
+
+static int feof_fake(FILE *stream) {
+  if (ff6_obb_is_handle(&obb_reader, stream))
+    return ((ff6_obb_handle *)stream)->eof;
+  return feof(stream);
+}
+
+static int fclose_fake(FILE *stream) {
+  if (ff6_obb_is_handle(&obb_reader, stream))
+    return ff6_obb_close(&obb_reader, (ff6_obb_handle *)stream);
+  return fclose(stream);
+}
+
 static int fprintf_hook(FILE *stream, const char *fmt, ...) {
   va_list list;
   int ret;
@@ -209,7 +264,7 @@ static int fputc_hook(int c, FILE *stream) {
 }
 
 static int fflush_hook(FILE *stream) {
-  if (!stream || is_fake_stdio(stream))
+  if (!stream || is_fake_stdio(stream) || ff6_obb_is_handle(&obb_reader, stream))
     return 0;
   return fflush(stream);
 }
@@ -225,6 +280,8 @@ static int vfprintf_hook(FILE *stream, const char *fmt, va_list list) {
 }
 
 static int ferror_hook(FILE *stream) {
+  if (ff6_obb_is_handle(&obb_reader, stream))
+    return ((ff6_obb_handle *)stream)->err;
   return is_fake_stdio(stream) ? 0 : ferror(stream);
 }
 
@@ -367,7 +424,14 @@ static int open_fake(const char *path, int flags, ...) {
 static FILE *fopen_fake(const char *path, const char *mode) {
   char buf[256];
   path = translate_path(path, buf, sizeof(buf));
-  return path ? fopen(path, mode) : NULL;
+  if (!path)
+    return NULL;
+  if (options.obb_reader) {
+    ff6_obb_handle *obb = ff6_obb_open(&obb_reader, path, mode);
+    if (obb)
+      return (FILE *)obb;
+  }
+  return fopen(path, mode);
 }
 
 static int remove_fake(const char *path) {
@@ -889,11 +953,16 @@ static void CallStaticVoidMethodV(void *env, void *clazz, int methodID,
   }
 }
 
+#ifdef FF6_DEBUG
+static jni_intarray *lp_getTextImg(void);
+static int lp_getTextWidth(void);
+#endif
+
 static int CallIntMethodV(void *env, void *obj, int methodID,
                           uintptr_t *args) {
   switch (methodID) {
   case GET_TEXT_WIDTH:
-    return getTextWidth();
+    return DBG_ALT(lp_getTextWidth, getTextWidth)();
   case GET_TEXT_HEIGHT:
     return getTextHeight();
   case GET_TEXT_FONT_SIZE:
@@ -945,7 +1014,7 @@ static void *CallObjectMethodV(void *env, void *obj, int methodID,
                                uintptr_t *args) {
   switch (methodID) {
   case GET_TEXT_IMG:
-    return getTextImg();
+    return DBG_ALT(lp_getTextImg, getTextImg)();
   case GET_DATA_DIRECTORY:
     return NewStringUTF(env, getDataDirectory());
   case GET_OBB_DIRECTORY:
@@ -1573,6 +1642,327 @@ static void ANativeWindow_setBuffersGeometry(void *window, int w, int h,
                                              int format) {}
 
 /* ==========================================================================
+ * Asset loading: faster gzip and a cache of decoded assets
+ * ======================================================================== */
+
+/* Yat::Gzip runs inflateInit2_ for gzip, then inflate(Z_FINISH) twice on the whole
+ * input and an output of the stored size, and takes the second result. libpng's
+ * streams come in through inflateInit_ and never get here. z_stream's reserved
+ * field, which zlib leaves alone, tells these calls apart. */
+#define FF6_GUNZIP_FRESH 0x47464631u
+#define FF6_GUNZIP_DONE 0x47464632u
+
+static unsigned gunzip_fast, gunzip_fallback;
+#ifdef FF6_DEBUG
+/* cache-verify.trigger: every shortcut also runs the slow way and compares. */
+static int asset_verify;
+static unsigned asset_verify_bad;
+
+static void gunzip_verify(const Bytef *in, uInt in_size, const Bytef *out, uInt out_size) {
+  Bytef *copy = (Bytef *)malloc(out_size);
+  z_stream z;
+  memset(&z, 0, sizeof(z));
+  if (!copy || inflateInit2(&z, 31) != Z_OK) {
+    free(copy);
+    return;
+  }
+  z.next_in = (Bytef *)in;
+  z.avail_in = in_size;
+  z.next_out = copy;
+  z.avail_out = out_size;
+  const int result = inflate(&z, Z_FINISH);
+  inflateEnd(&z);
+  if (result != Z_STREAM_END || memcmp(copy, out, out_size)) {
+    asset_verify_bad++;
+    trace("[verify] gunzip differs from zlib: %u bytes, zlib said %d\n", out_size, result);
+  }
+  free(copy);
+}
+#endif
+
+static int inflateInit2_fake(z_streamp strm, int bits, const char *version, int size) {
+  const int result = inflateInit2_(strm, bits, version, size);
+  if (result == Z_OK)
+    strm->reserved = bits == 31 && options.fast_gzip ? FF6_GUNZIP_FRESH : 0;
+  return result;
+}
+
+static int inflate_fake(z_streamp strm, int flush) {
+  if (strm->reserved == FF6_GUNZIP_DONE)
+    return Z_STREAM_END;
+  if (strm->reserved == FF6_GUNZIP_FRESH) {
+    strm->reserved = 0;
+    size_t used = 0;
+    if (flush == Z_FINISH &&
+        ff6_gunzip(strm->next_in, strm->avail_in, strm->next_out, strm->avail_out, &used)) {
+#ifdef FF6_DEBUG
+      if (asset_verify)
+        gunzip_verify(strm->next_in, strm->avail_in, strm->next_out, strm->avail_out);
+#endif
+      strm->next_in += used;
+      strm->avail_in -= (uInt)used;
+      strm->total_in = used;
+      strm->total_out = strm->avail_out;
+      strm->next_out += strm->avail_out;
+      strm->avail_out = 0;
+      strm->reserved = FF6_GUNZIP_DONE;
+      gunzip_fast++;
+      return Z_STREAM_END;
+    }
+    gunzip_fallback++;
+  }
+  return inflate(strm, flush);
+}
+
+static void *asset_alloc(void *mspace, size_t size) {
+  return sceClibMspaceMalloc(mspace, size);
+}
+static void asset_release(void *mspace, void *block) { sceClibMspaceFree(mspace, block); }
+
+static ff6_asset_ops asset_ops = {asset_alloc, asset_release, NULL};
+static ff6_asset_cache asset_cache;
+
+/* Its own memory, so that no engine allocation ever fails or fragments because of
+ * a cached file. Taken before vitaGL claims what is left. */
+static void asset_cache_create(void) {
+  const size_t size = (size_t)options.asset_cache_mb * 1024 * 1024;
+  void *base = NULL;
+  SceUID block = -1;
+  if (size) {
+    block = sceKernelAllocMemBlock("ff6_assets", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, size, NULL);
+    if (block >= 0)
+      sceKernelGetMemBlockBase(block, &base);
+  }
+  void *mspace = base ? sceClibMspaceCreate(base, size) : NULL;
+  asset_ops.context = mspace;
+  ff6_asset_init(&asset_cache, &asset_ops, mspace ? size : 0);
+#ifdef FF6_DEBUG
+  SceKernelFreeMemorySizeInfo memory;
+  memory.size = sizeof(memory);
+  sceKernelGetFreeMemorySize(&memory);
+  trace("[assets] %u MB cache: %s; %u MB left for vitaGL\n", (unsigned)options.asset_cache_mb,
+        mspace ? "ready" : "off", (unsigned)(memory.size_user / (1024 * 1024)));
+#endif
+}
+
+static int asset_cacheable(const char *name) {
+  const char *dot = name ? strrchr(name, '.') : NULL;
+  return dot && (!strcmp(dot, ".gz") || !strcmp(dot, ".png") || !strcmp(dot, ".akb"));
+}
+
+/* The hooks overwrite eight bytes; each trampoline replays them. None of these
+ * instructions depends on where it runs. */
+extern "C" {
+uintptr_t ff6_loadasset_resume, ff6_pnginfo_resume, ff6_pngimage_resume;
+}
+
+__attribute__((naked, target("thumb"))) static void *
+loadasset_original(const char *name, void *buffer, unsigned *size) {
+  __asm__("push {r4, r5, r6, lr}\n"
+          "sub sp, #8\n"
+          "mov r5, r1\n"
+          "mov r6, r2\n"
+          "ldr.w ip, =ff6_loadasset_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+__attribute__((naked, target("thumb"))) static void
+pnginfo_original(void *png, void *info) {
+  __asm__("push.w {r3, r4, r5, r6, r7, r8, r9, lr}\n"
+          "rsbs.w r3, r0, #1\n"
+          "ldr.w ip, =ff6_pnginfo_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+__attribute__((naked, target("thumb"))) static void
+pngimage_original(void *png, unsigned char **rows) {
+  __asm__("push.w {r4, r5, r6, r7, r8, r9, r10, lr}\n"
+          "mov r7, r0\n"
+          "mov r10, r1\n"
+          "ldr.w ip, =ff6_pngimage_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+/* loadAssetDirect(name, buffer or NULL, size or NULL): the buffer is the caller's
+ * to change and free, so a hit is always a copy. A missing file leaves *size alone
+ * and returns the buffer it was given. */
+static void *loadasset_cached(const char *name, void *buffer, unsigned *size_out) {
+  if (!asset_cacheable(name))
+    return loadasset_original(name, buffer, size_out);
+
+  size_t cached_size = 0;
+  ff6_asset_entry *pin = NULL;
+  const void *cached = ff6_asset_pin(&asset_cache, name, &cached_size, &pin);
+  if (cached) {
+    void *result = buffer ? buffer : malloc(cached_size);
+    if (result) {
+      memcpy(result, cached, cached_size);
+#ifdef FF6_DEBUG
+      if (asset_verify) {
+        unsigned size = 0;
+        void *fresh = loadasset_original(name, NULL, &size);
+        if (!fresh || size != cached_size || memcmp(fresh, cached, size)) {
+          asset_verify_bad++;
+          trace("[verify] cached %s differs\n", name);
+        }
+        free(fresh);
+      }
+#endif
+      ff6_asset_unpin(&asset_cache, pin);
+      if (size_out)
+        *size_out = (unsigned)cached_size;
+      return result;
+    }
+    ff6_asset_unpin(&asset_cache, pin);
+  }
+
+  const unsigned missing = 0xffffffffu;
+  unsigned size = missing;
+  void *result = loadasset_original(name, buffer, &size);
+  if (size != missing) {
+    if (size_out)
+      *size_out = size;
+    if (result)
+      ff6_asset_put(&asset_cache, name, result, size);
+  }
+  return result;
+}
+
+/* Pixels of a PNG, kept under its name with this suffix: cPng::Open loads the file
+ * through loadAssetDirect, reads its header and then the whole image, with no
+ * transform in between. Rows are the file's own, so they don't depend on the
+ * caller. The names are per thread because cPng::Open can run on several. */
+#define FF6_PNG_NAME_MAX 160
+static const char ff6_png_suffix[] = "#pixels";
+typedef uint32_t (*png_get_value)(void *png, void *info);
+static png_get_value png_rowbytes_fn, png_height_fn;
+static volatile SceUID png_thread;
+static char png_name[FF6_PNG_NAME_MAX];
+static void *png_seen, *png_seen_info;
+static int png_armed;
+
+/* Only the first header after a load belongs to that file. */
+static void pnginfo_cached(void *png, void *info) {
+  pnginfo_original(png, info);
+  if (png_armed && png_thread == sceKernelGetThreadId()) {
+    png_armed = 0;
+    png_seen = png;
+    png_seen_info = info;
+  }
+}
+
+static void *loadasset_named(const char *name, void *buffer, unsigned *size) {
+  const size_t length = name ? strlen(name) : 0;
+  const char *dot = name ? strrchr(name, '.') : NULL;
+  if (dot && !strcmp(dot, ".png") && length + sizeof(ff6_png_suffix) <= FF6_PNG_NAME_MAX) {
+    png_thread = sceKernelGetThreadId();
+    memcpy(png_name, name, length);
+    memcpy(png_name + length, ff6_png_suffix, sizeof(ff6_png_suffix));
+    png_seen = NULL;
+    png_armed = 1;
+  }
+  return loadasset_cached(name, buffer, size);
+}
+
+static void pngimage_cached(void *png, unsigned char **rows) {
+  /* Only the image the last loadAssetDirect on this thread brought in. */
+  if (!png_rowbytes_fn || png != png_seen || png_thread != sceKernelGetThreadId() || !rows) {
+    pngimage_original(png, rows);
+    return;
+  }
+  png_seen = NULL;
+  const size_t row = png_rowbytes_fn(png, png_seen_info);
+  const size_t height = png_height_fn(png, png_seen_info);
+  const size_t total = row * height;
+  if (!total || total > asset_cache.budget / 2) {
+    pngimage_original(png, rows);
+    return;
+  }
+
+  size_t cached_size = 0;
+  ff6_asset_entry *pin = NULL;
+  const unsigned char *cached =
+      (const unsigned char *)ff6_asset_pin(&asset_cache, png_name, &cached_size, &pin);
+  if (cached) {
+    if (cached_size == total) {
+#ifdef FF6_DEBUG
+      if (asset_verify) {
+        pngimage_original(png, rows);
+        for (size_t y = 0; y < height; y++) {
+          if (memcmp(rows[y], cached + y * row, row)) {
+            asset_verify_bad++;
+            trace("[verify] pixels of %s differ\n", png_name);
+            break;
+          }
+        }
+      }
+#endif
+      for (size_t y = 0; y < height; y++)
+        memcpy(rows[y], cached + y * row, row);
+      ff6_asset_unpin(&asset_cache, pin);
+      return;
+    }
+    ff6_asset_unpin(&asset_cache, pin);
+    pngimage_original(png, rows);
+    return;
+  }
+
+  pngimage_original(png, rows);
+  unsigned char *flat = (unsigned char *)malloc(total);
+  if (!flat)
+    return;
+  for (size_t y = 0; y < height; y++)
+    memcpy(flat + y * row, rows[y], row);
+  ff6_asset_put(&asset_cache, png_name, flat, total);
+  free(flat);
+}
+
+/* Returns 0, leaving the game alone, on a build these eight bytes don't describe. */
+static int hook_replaying(uintptr_t addr, const uint16_t *prologue, uintptr_t *resume,
+                          uintptr_t hook, const char *name) {
+  const uint16_t *code = (const uint16_t *)(addr & ~(uintptr_t)1);
+  if (!addr || memcmp(code, prologue, 4 * sizeof(uint16_t)) != 0 || ((uintptr_t)code & 2)) {
+    trace("[hook] %s has an unknown prologue, left alone\n", name);
+    return 0;
+  }
+  *resume = (uintptr_t)&code[4] | 1;
+  hook_addr(addr, hook);
+  return 1;
+}
+
+static void install_asset_cache(void) {
+  if (!asset_cache.budget)
+    return;
+  static const uint16_t loadasset_prologue[4] = {0xb570, 0xb082, 0x460d, 0x4616};
+  if (!hook_replaying(so_symbol(&ff6_mod, "loadAssetDirect"), loadasset_prologue,
+                      &ff6_loadasset_resume, (uintptr_t)&loadasset_named, "loadAssetDirect"))
+    return;
+
+  static const uint16_t pnginfo_prologue[4] = {0xe92d, 0x43f8, 0xf1d0, 0x0301};
+  static const uint16_t pngimage_prologue[4] = {0xe92d, 0x47f0, 0x4607, 0x468a};
+  const uintptr_t rowbytes = so_symbol(&ff6_mod, "png_get_rowbytes");
+  const uintptr_t height = so_symbol(&ff6_mod, "png_get_image_height");
+  const uintptr_t info = so_symbol(&ff6_mod, "png_read_info");
+  const uintptr_t image = so_symbol(&ff6_mod, "png_read_image");
+  if (!rowbytes || !height)
+    return;
+  if (!hook_replaying(info, pnginfo_prologue, &ff6_pnginfo_resume, (uintptr_t)&pnginfo_cached,
+                      "png_read_info"))
+    return;
+  if (hook_replaying(image, pngimage_prologue, &ff6_pngimage_resume,
+                     (uintptr_t)&pngimage_cached, "png_read_image")) {
+    png_rowbytes_fn = (png_get_value)rowbytes;
+    png_height_fn = (png_get_value)height;
+  }
+}
+
+/* ==========================================================================
  * GL shims
  * ======================================================================== */
 
@@ -1740,6 +2130,182 @@ static volatile unsigned last_shim_arg;
     mark_shim((x), (unsigned)(a));                                             \
   } while (0)
 
+/* Load profile: what a transition into a menu or a battle spends on files,
+ * inflate, decoding and texture uploads. Totals are cumulative; load_profile_frame
+ * turns them into [gap] lines (one long frame), [burst] lines (one whole load)
+ * and, with libperf, rows of ux0:data/ff6/perf.csv. */
+enum {
+  LP_OPEN,
+  LP_READ,
+  LP_SEEK,
+  LP_INFLATE,
+  LP_TEX,
+  LP_SUB,
+  LP_DRAW,
+  LP_SWAP,
+  LP_SLEEP,
+  /* Scopes below: their time minus the measured regions inside them. */
+  LP_TEXT,
+  LP_DECODE_SELF,
+  LP_PNG_SELF,
+  LP_FLB_INIT_SELF,
+  LP_FLB_DATA_SELF,
+  LP_LEAVES,          /* Everything before this adds up without double counting. */
+  LP_PNG = LP_LEAVES, /* Inclusive. */
+  LP_TGA,             /* Inclusive. */
+  LP_PNG_OPEN,        /* Inclusive. */
+  LP_FLB_INIT,        /* Inclusive. */
+  LP_FLB_DATA,        /* Inclusive. */
+  LP_MALLOC,          /* Calls and bytes only: a span would cost more than most. */
+  LP_MEMCPY,
+  LP_MEMSET,
+  LP_COUNT
+};
+static const char *const lp_names[LP_COUNT] = {
+    "file_open", "file_read",  "file_seek",     "inflate",       "tex_image",
+    "tex_sub",   "gl_draw",    "swap",          "sleep",         "text",
+    "decode_self", "png_self", "flb_init_self", "flb_data_self", "ui_png",
+    "ui_tga",    "png_open",   "flb_init",      "flb_data",      "malloc",
+    "memcpy",    "memset"};
+
+typedef struct {
+  unsigned calls, pmu_calls;
+  uint64_t wall_us, max_us, cycles, bytes;
+} lp_region;
+
+typedef struct {
+  lp_region r[LP_COUNT];
+  unsigned small_reads;
+} lp_totals;
+
+static lp_totals lp;
+
+/* profile.trigger: nothing but counters while measuring. The per-file trace lines
+ * are synchronous writes to the memory card and the sub-image checksums touch
+ * every uploaded byte, and neither exists in a release build. */
+static int lp_quiet;
+
+#ifdef FF6_LIBPERF
+#define PERF_EVENTS 6
+static const struct {
+  const char *name;
+  SceUInt8 code;
+} perf_events[PERF_EVENTS] = {
+    {"rename", 0x68},      {"dcache_miss", 0x03}, {"icache_miss", 0x01},
+    {"mispredict", 0x10},  {"dstall", 0x61},      {"istall", 0x60},
+};
+
+/* Set once the kernel provider and user module are up. Counting is per thread
+ * and only the engine thread, which does the loading, is configured. */
+static int perf_loaded;
+static volatile SceUID perf_thread;
+
+static void perf_load(void) {
+  int status = 0;
+  SceUID module =
+      sceKernelLoadStartModule("app0:libperf.suprx", 0, NULL, 0, NULL, &status);
+  perf_loaded = module >= 0 && status == SCE_KERNEL_START_SUCCESS;
+  trace("[perf] module=0x%08x status=0x%08x %s\n", (unsigned)module,
+        (unsigned)status, perf_loaded ? "ready" : "unavailable");
+}
+
+static inline int perf_counting(void) {
+  return perf_thread && sceKernelGetThreadId() == perf_thread;
+}
+
+static inline uint32_t perf_cycles(void) {
+  SceUInt32 value = 0;
+  scePerfArmPmonGetCounterValue(SCE_PERF_ARM_PMON_THREAD_ID_SELF,
+                                SCE_PERF_ARM_PMON_COUNTER_CYCLE, &value);
+  return value;
+}
+
+static void perf_read_events(uint32_t *values) {
+  values[PERF_EVENTS] = perf_cycles();
+  for (unsigned i = 0; i < PERF_EVENTS; i++) {
+    SceUInt32 value = 0;
+    scePerfArmPmonGetCounterValue(SCE_PERF_ARM_PMON_THREAD_ID_SELF, i, &value);
+    values[i] = value;
+  }
+}
+#else
+static inline int perf_counting(void) { return 0; }
+static inline uint32_t perf_cycles(void) { return 0; }
+#endif
+
+typedef struct {
+  uint64_t us;
+  uint32_t cycles;
+  int counted;
+} lp_span;
+
+static inline lp_span lp_begin(void) {
+  lp_span span;
+  span.counted = perf_counting();
+  span.cycles = span.counted ? perf_cycles() : 0;
+  span.us = sceKernelGetSystemTimeWide();
+  return span;
+}
+
+/* Engine thread's running total in leaf regions; a scope subtracts its growth. */
+static uint64_t lp_child_us, lp_child_cycles;
+
+static inline void lp_end(int id, lp_span span, uint64_t bytes) {
+  const uint64_t wall = sceKernelGetSystemTimeWide() - span.us;
+  lp_region *region = &lp.r[id];
+  region->calls++;
+  region->wall_us += wall;
+  region->bytes += bytes;
+  if (wall > region->max_us)
+    region->max_us = wall;
+  uint32_t cycles = 0;
+  if (span.counted) {
+    cycles = perf_cycles() - span.cycles;
+    region->pmu_calls++;
+    region->cycles += cycles;
+    lp_child_us += wall;
+    lp_child_cycles += cycles;
+  }
+}
+
+/* Only on the engine thread, the one the running totals belong to. */
+typedef struct {
+  lp_span span;
+  uint64_t child_us, child_cycles;
+} lp_scope;
+
+static inline lp_scope lp_scope_begin(void) {
+  lp_scope scope;
+  scope.child_us = lp_child_us;
+  scope.child_cycles = lp_child_cycles;
+  scope.span = lp_begin();
+  return scope;
+}
+
+static void lp_add(int id, uint64_t wall, uint64_t cycles) {
+  lp_region *region = &lp.r[id];
+  region->calls++;
+  region->pmu_calls++;
+  region->wall_us += wall;
+  region->cycles += cycles;
+  if (wall > region->max_us)
+    region->max_us = wall;
+}
+
+static void lp_scope_end(int inclusive, int self, lp_scope scope) {
+  const uint64_t wall = sceKernelGetSystemTimeWide() - scope.span.us;
+  const uint64_t cycles = perf_cycles() - scope.span.cycles;
+  const uint64_t child_us = lp_child_us - scope.child_us;
+  const uint64_t child_cycles = lp_child_cycles - scope.child_cycles;
+  const uint64_t self_us = wall > child_us ? wall - child_us : 0;
+  const uint64_t self_cycles = cycles > child_cycles ? cycles - child_cycles : 0;
+  if (inclusive >= 0)
+    lp_add(inclusive, wall, cycles);
+  lp_add(self, self_us, self_cycles);
+  lp_child_us += self_us;
+  lp_child_cycles += self_cycles;
+}
+
 static int open_mark(const char *path, int flags, ...) {
   int mode = 0;
   if (flags & BIONIC_O_CREAT) {
@@ -1766,7 +2332,9 @@ static FILE *fopen_mark(const char *path, const char *mode) {
   MARK("fopen");
   char buf[256];
   path = translate_path(path, buf, sizeof(buf));
-  FILE *f = path ? fopen(path, mode) : NULL;
+  const lp_span span = lp_begin();
+  FILE *f = path ? fopen_fake(path, mode) : NULL;
+  lp_end(LP_OPEN, span, 0);
   /* Writes are rare and they are the ones that matter: a save that reports
    * success while no file appears fails somewhere on this line. */
   int is_write = mode && (mode[0] == 'w' || mode[0] == 'a');
@@ -1787,18 +2355,278 @@ static FILE *fopen_mark(const char *path, const char *mode) {
 
 static size_t fread_mark(void *p, size_t sz, size_t n, FILE *f) {
   MARK1("fread", sz * n);
-  return fread(p, sz, n, f);
+  const lp_span span = lp_begin();
+  size_t done = fread_fake(p, sz, n, f);
+  lp_end(LP_READ, span, done * sz);
+  if (sz * n < 4096)
+    lp.small_reads++;
+  return done;
 }
 
 static int fseek_mark(FILE *f, long off, int whence) {
   MARK("fseek");
-  return fseek(f, off, whence);
+  const lp_span span = lp_begin();
+  int result = fseek_fake(f, off, whence);
+  lp_end(LP_SEEK, span, 0);
+  return result;
+}
+
+static int inflate_mark(z_streamp strm, int flush) {
+  const uLong out_before = strm->total_out;
+  const lp_span span = lp_begin();
+  int result = inflate_fake(strm, flush);
+  lp_end(LP_INFLATE, span, strm->total_out - out_before);
+  return result;
+}
+
+/* Names the files inside the .obb: the fopen below Rock::File::Open only ever
+ * sees the archive path. The entry is hooked rather than patched at runtime
+ * because Dynarmic would keep running the stale translation. The trampoline
+ * replays the three instructions the hook overwrites; the third one loads a
+ * PC-relative literal, so its value is read when the hook is installed. */
+extern "C" {
+uint32_t ff6_rockopen_literal;
+uintptr_t ff6_rockopen_resume;
+}
+
+__attribute__((naked, target("thumb"))) static int
+rockopen_original(void *self, const char *name) {
+  __asm__("push.w {r4, r5, r6, r7, r8, r9, r10, lr}\n"
+          "sub sp, #288\n"
+          "ldr r4, =ff6_rockopen_literal\n"
+          "ldr r4, [r4]\n"
+          "ldr.w ip, =ff6_rockopen_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+static int rockopen_mark(void *self, const char *name) {
+  if (lp_quiet)
+    return rockopen_original(self, name);
+  const uint64_t start = sceKernelGetSystemTimeWide();
+  int result = rockopen_original(self, name);
+  const uint64_t now = sceKernelGetSystemTimeWide();
+  trace("[file] t=%llums %s -> %d in %uus\n",
+        (unsigned long long)(now / 1000), name ? name : "(null)", result,
+        (unsigned)(now - start));
+  return result;
+}
+
+static void hook_rockopen(uintptr_t addr) {
+  const uint16_t *code = (const uint16_t *)(addr & ~(uintptr_t)1);
+  if (code[0] != 0xe92d || code[1] != 0x47f0 || code[2] != 0xb0c8 ||
+      (code[3] & 0xff00) != 0x4c00 || ((uintptr_t)code & 2)) {
+    trace("[file] Rock::File::Open has an unknown prologue, names disabled\n");
+    return;
+  }
+  const uintptr_t pc = ((uintptr_t)&code[3] + 4) & ~(uintptr_t)3;
+  ff6_rockopen_literal = *(const uint32_t *)(pc + (code[3] & 0xff) * 4);
+  ff6_rockopen_resume = (uintptr_t)&code[4] | 1;
+  hook_addr(addr, (uintptr_t)&rockopen_mark);
+}
+
+/* cUiMgr decoders: file access, inflate and pixel work for one image. The
+ * trampolines replay the overwritten prologues, none of them PC-relative. */
+extern "C" {
+uintptr_t ff6_png_resume, ff6_tga_resume;
+}
+
+__attribute__((naked, target("thumb"))) static void *
+png_original(void *self, const char *name) {
+  __asm__("push {r4, r5, r6, lr}\n"
+          "add.w r6, r0, #8\n"
+          "mov r5, r1\n"
+          "ldr.w ip, =ff6_png_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+__attribute__((naked, target("thumb"))) static void *
+tga_original(void *self, const char *name) {
+  __asm__("push {r3, r4, r5, r6, r7, lr}\n"
+          "add.w r7, r0, #8\n"
+          "mov r6, r1\n"
+          "ldr.w ip, =ff6_tga_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+static void *decode_mark(int id, void *(*original)(void *, const char *),
+                         void *self, const char *name) {
+  if (!perf_counting())
+    return original(self, name);
+  const lp_scope scope = lp_scope_begin();
+  void *result = original(self, name);
+  lp_scope_end(id, LP_DECODE_SELF, scope);
+  return result;
+}
+
+static void *png_mark(void *self, const char *name) {
+  return decode_mark(LP_PNG, png_original, self, name);
+}
+
+static void *tga_mark(void *self, const char *name) {
+  return decode_mark(LP_TGA, tga_original, self, name);
+}
+
+/* cPng::Open starts with two PC-relative loads, read when the hook is installed;
+ * the add that makes them absolute runs in place, past the hook. */
+extern "C" {
+uint32_t ff6_pngopen_r2, ff6_pngopen_r3;
+uintptr_t ff6_pngopen_resume, ff6_flbinit_resume, ff6_flbdata_resume;
+}
+
+__attribute__((naked, target("thumb"))) static void *
+pngopen_original(void *self, const char *name) {
+  __asm__("ldr r2, =ff6_pngopen_r2\n"
+          "ldr r2, [r2]\n"
+          "ldr r3, =ff6_pngopen_r3\n"
+          "ldr r3, [r3]\n"
+          "ldr.w ip, =ff6_pngopen_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+static void *pngopen_mark(void *self, const char *name) {
+  if (!perf_counting())
+    return pngopen_original(self, name);
+  const lp_scope scope = lp_scope_begin();
+  void *result = pngopen_original(self, name);
+  lp_scope_end(LP_PNG_OPEN, LP_PNG_SELF, scope);
+  return result;
+}
+
+static void hook_pngopen(uintptr_t addr) {
+  const uint16_t *code = (const uint16_t *)(addr & ~(uintptr_t)1);
+  if (code[0] != 0xf8df || (code[1] & 0xf000) != 0x2000 || code[2] != 0xf8df ||
+      (code[3] & 0xf000) != 0x3000 || ((uintptr_t)code & 2)) {
+    trace("[perf] png_open has an unknown prologue, not measured\n");
+    return;
+  }
+  const uintptr_t first = ((uintptr_t)&code[0] + 4) & ~(uintptr_t)3;
+  const uintptr_t second = ((uintptr_t)&code[2] + 4) & ~(uintptr_t)3;
+  ff6_pngopen_r2 = *(const uint32_t *)(first + (code[1] & 0xfff));
+  ff6_pngopen_r3 = *(const uint32_t *)(second + (code[3] & 0xfff));
+  ff6_pngopen_resume = (uintptr_t)&code[4] | 1;
+  hook_addr(addr, (uintptr_t)&pngopen_mark);
+}
+
+/* CFlb::InitCommon builds the object tree of one .flb, CFlbData::Init parses it. */
+__attribute__((naked, target("thumb"))) static int
+flbinit_original(void *self, void *drawer, const char **names, unsigned short id) {
+  __asm__("push {r4, r5, r6, r7, lr}\n"
+          "mov r4, r0\n"
+          "sub sp, #12\n"
+          "mov r7, r1\n"
+          "ldr.w ip, =ff6_flbinit_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+__attribute__((naked, target("thumb"))) static int
+flbdata_original(void *self, const void *data, unsigned long size) {
+  __asm__("push.w {r3, r4, r5, r6, r7, r8, r9, r10, r11, lr}\n"
+          "mov r5, r0\n"
+          "mov r4, r1\n"
+          "ldr.w ip, =ff6_flbdata_resume\n"
+          "ldr.w ip, [ip]\n"
+          "bx ip\n"
+          ".ltorg\n");
+}
+
+static int flbinit_mark(void *self, void *drawer, const char **names, unsigned short id) {
+  if (!perf_counting())
+    return flbinit_original(self, drawer, names, id);
+  const lp_scope scope = lp_scope_begin();
+  int result = flbinit_original(self, drawer, names, id);
+  lp_scope_end(LP_FLB_INIT, LP_FLB_INIT_SELF, scope);
+  return result;
+}
+
+static int flbdata_mark(void *self, const void *data, unsigned long size) {
+  if (!perf_counting())
+    return flbdata_original(self, data, size);
+  const lp_scope scope = lp_scope_begin();
+  int result = flbdata_original(self, data, size);
+  lp_scope_end(LP_FLB_DATA, LP_FLB_DATA_SELF, scope);
+  return result;
+}
+
+static jni_intarray *lp_getTextImg(void) {
+  if (!perf_counting())
+    return getTextImg();
+  const lp_scope scope = lp_scope_begin();
+  jni_intarray *result = getTextImg();
+  lp_scope_end(-1, LP_TEXT, scope);
+  return result;
+}
+
+static int lp_getTextWidth(void) {
+  if (!perf_counting())
+    return getTextWidth();
+  const lp_scope scope = lp_scope_begin();
+  int result = getTextWidth();
+  lp_scope_end(-1, LP_TEXT, scope);
+  return result;
+}
+
+static inline void lp_count(int id, size_t bytes) {
+  lp.r[id].calls++;
+  lp.r[id].bytes += bytes;
+}
+
+static void *malloc_mark(size_t size) {
+  lp_count(LP_MALLOC, size);
+  return malloc(size);
+}
+
+static void *memcpy_mark(void *dst, const void *src, size_t n) {
+  lp_count(LP_MEMCPY, n);
+  return memcpy(dst, src, n);
+}
+
+static void *memset_mark(void *dst, int c, size_t n) {
+  lp_count(LP_MEMSET, n);
+  return memset(dst, c, n);
+}
+
+static void *aeabi_memset_mark(void *dst, size_t n, int c) {
+  lp_count(LP_MEMSET, n);
+  return memset(dst, c, n);
+}
+
+static void *aeabi_memclr_mark(void *dst, size_t n) {
+  lp_count(LP_MEMSET, n);
+  return memset(dst, 0, n);
+}
+
+static void hook_decoder(uintptr_t addr, const uint16_t *prologue,
+                         uintptr_t *resume, uintptr_t hook, const char *name) {
+  const uint16_t *code = (const uint16_t *)(addr & ~(uintptr_t)1);
+  if (memcmp(code, prologue, 4 * sizeof(uint16_t)) != 0 || ((uintptr_t)code & 2)) {
+    trace("[perf] %s has an unknown prologue, not measured\n", name);
+    return;
+  }
+  *resume = (uintptr_t)&code[4] | 1;
+  hook_addr(addr, hook);
 }
 
 static int usleep_mark(unsigned int usec) {
   MARK1("usleep", usec);
-  if (usec)
+  if (!usec)
+    return 0;
+  if (!perf_counting()) {
     sceKernelDelayThread(usec);
+    return 0;
+  }
+  const lp_span span = lp_begin();
+  sceKernelDelayThread(usec);
+  lp_end(LP_SLEEP, span, 0);
   return 0;
 }
 
@@ -2422,7 +3250,9 @@ static void glDrawArraysHook(GLenum mode, GLint first, GLsizei count) {
   }
 
   apply_fixed_arrays(first, count);
+  const lp_span draw_span = lp_begin();
   glDrawArrays(mode, first, count);
+  lp_end(LP_DRAW, draw_span, 0);
 
   /* scene_reset() runs at the top of vitaGL's glDrawArrays, so a delta here
      names the exact draw whose submission split the scene. */
@@ -2900,9 +3730,12 @@ static void glTexImage2DHook(GLenum target, GLint level, GLint internalformat,
     tex_info[gl_bound_texture].bpp = gl_upload_bpp(format, type);
     tex_info[gl_bound_texture].last_sub_frame = 0;
   }
-  upload_summary("img", width, height, format, type, pixels);
+  if (!lp_quiet)
+    upload_summary("img", width, height, format, type, pixels);
+  const lp_span span = lp_begin();
   glTexImage2D(target, level, internalformat, width, height, border, format,
                type, pixels);
+  lp_end(LP_TEX, span, (uint64_t)width * height * gl_upload_bpp(format, type));
 }
 
 static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
@@ -2921,7 +3754,8 @@ static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
   {
     static int logged;
     static int battle_logged;
-    if (logged < 400) {
+    if (lp_quiet) {
+    } else if (logged < 400) {
       logged++;
       upload_summary("sub", width, height, format, type, pixels);
     } else if (gl_bound_texture >= 300 && battle_logged < 60) {
@@ -2946,7 +3780,7 @@ static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
     }
   }
 
-  if (pixels && width > 0 && height > 0) {
+  if (!lp_quiet && pixels && width > 0 && height > 0) {
     const unsigned char *p = (const unsigned char *)pixels;
     unsigned n = (unsigned)width * (unsigned)height * gl_upload_bpp(format, type);
     unsigned sum = 2166136261u;
@@ -2968,8 +3802,11 @@ static void glTexSubImage2DHook(GLenum target, GLint level, GLint xoffset,
     sub_ring_pos++;
   }
 
+  /* Only the real call: the checksum above is a debug cost of its own. */
+  const lp_span span = lp_begin();
   glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type,
                   pixels);
+  lp_end(LP_SUB, span, (uint64_t)width * height * gl_upload_bpp(format, type));
 }
 
 static void glActiveTextureHook(GLenum unit) {
@@ -2993,6 +3830,323 @@ extern "C" uint32_t vgl_debug_log_draws;
 
 unsigned glyph_uploads;
 
+extern int ff6_current_map(void);
+extern int ff6_current_mode(void);
+
+static void lp_format(char *out, size_t size, const lp_totals *now,
+                      const lp_totals *base) {
+  size_t used = 0;
+  for (int i = 0; i < LP_LEAVES && used < size; i++) {
+    const lp_region *a = &now->r[i], *b = &base->r[i];
+    int n = snprintf(out + used, size - used, "%s=%u/%uKB/%ums ", lp_names[i],
+                     a->calls - b->calls, (unsigned)((a->bytes - b->bytes) / 1024),
+                     (unsigned)((a->wall_us - b->wall_us) / 1000));
+    if (n < 0)
+      break;
+    used += (size_t)n;
+  }
+}
+
+#ifdef FF6_LIBPERF
+/* One label per load, whichever frame the mode flips on: entering a battle
+ * flips first and loads after, opening the menu the other way round. */
+static void lp_scene_name(char *out, size_t size, int from, int to, int previous,
+                          int just_flipped) {
+  /* Mid-battle effects load too: same mode, long after it flipped. */
+  if (from == to && just_flipped)
+    from = previous;
+  if (from == 1 && to == 16)
+    snprintf(out, size, "menu_open");
+  else if (from == 16 && to == 1)
+    snprintf(out, size, "menu_close");
+  else if (to == 6 && from != 6)
+    snprintf(out, size, "battle_enter");
+  else if (from == 6 && to != 6)
+    snprintf(out, size, "battle_exit");
+  else
+    snprintf(out, size, "mode%d_to_%d", from, to);
+}
+
+/* Frames of one load: those that touched a file and those drawn in between. */
+typedef struct {
+  unsigned frames;
+  uint64_t wall_us, max_us, cycles;
+} lp_frames;
+
+/* Written after the load has gone quiet, so it is outside every interval. */
+static void perf_csv_write(const char *scene, uint64_t begin_us, uint64_t wall_us,
+                           const uint32_t *start, const uint32_t *end,
+                           const lp_totals *now, const lp_totals *base,
+                           const lp_frames *loading, const lp_frames *between) {
+  SceUID fd = sceIoOpen(DATA_PATH "/perf.csv",
+                        SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
+  if (fd < 0)
+    return;
+  char line[384];
+  int n;
+  SceIoStat stat;
+  if (sceIoGetstatByFd(fd, &stat) >= 0 && stat.st_size == 0) {
+    n = snprintf(line, sizeof(line),
+                 "# libperf.csv,version=1\nregion,thread,session,timestamp_us,"
+                 "calls,pmu_calls,wall_us,max_us,cycles,bytes");
+    sceIoWrite(fd, line, n);
+    for (unsigned i = 0; i < PERF_EVENTS; i++) {
+      n = snprintf(line, sizeof(line), ",event.%s.0x%02x", perf_events[i].name,
+                   perf_events[i].code);
+      sceIoWrite(fd, line, n);
+    }
+    sceIoWrite(fd, "\n", 1);
+  }
+  char session[32];
+  snprintf(session, sizeof(session), "obb%d_gz%d_c%d", options.obb_reader, options.fast_gzip,
+           options.asset_cache_mb);
+  /* Counters are 32 bits: past this they could have wrapped unnoticed. */
+  const int cycles_valid = wall_us < 8000000;
+  const uint64_t cycles =
+      cycles_valid ? (uint32_t)(end[PERF_EVENTS] - start[PERF_EVENTS]) : 0;
+  n = snprintf(line, sizeof(line),
+               "%s:total,engine,%s,%llu,1,%d,%llu,%llu,", scene, session,
+               (unsigned long long)begin_us, cycles_valid,
+               (unsigned long long)wall_us, (unsigned long long)wall_us);
+  sceIoWrite(fd, line, n);
+  if (cycles_valid) {
+    n = snprintf(line, sizeof(line), "%llu", (unsigned long long)cycles);
+    sceIoWrite(fd, line, n);
+  }
+  sceIoWrite(fd, ",", 1);
+  for (unsigned i = 0; i < PERF_EVENTS; i++) {
+    n = cycles_valid ? snprintf(line, sizeof(line), ",%u", (unsigned)(end[i] - start[i]))
+                     : snprintf(line, sizeof(line), ",");
+    sceIoWrite(fd, line, n);
+  }
+  sceIoWrite(fd, "\n", 1);
+
+  uint64_t leaf_us = 0, leaf_cycles = 0;
+  for (int i = 0; i < LP_COUNT; i++) {
+    const lp_region *a = &now->r[i], *b = &base->r[i];
+    const unsigned calls = a->calls - b->calls;
+    const unsigned pmu_calls = a->pmu_calls - b->pmu_calls;
+    const uint64_t wall = a->wall_us - b->wall_us;
+    const uint64_t counted = a->cycles - b->cycles;
+    if (i < LP_LEAVES) {
+      leaf_us += wall;
+      leaf_cycles += counted;
+    }
+    if (!calls)
+      continue;
+    n = snprintf(line, sizeof(line),
+                 "%s:%s,engine,%s,%llu,%u,%u,%llu,%llu,%llu,%llu,,,,,,\n",
+                 scene, lp_names[i], session, (unsigned long long)begin_us, calls,
+                 pmu_calls, (unsigned long long)wall, (unsigned long long)a->max_us,
+                 (unsigned long long)counted, (unsigned long long)(a->bytes - b->bytes));
+    sceIoWrite(fd, line, n);
+  }
+  /* Not measured by any region: engine logic, allocation, GL, presenting. */
+  n = snprintf(line, sizeof(line), "%s:other,engine,%s,%llu,1,%d,%llu,,",
+               scene, session, (unsigned long long)begin_us, cycles_valid,
+               (unsigned long long)(wall_us > leaf_us ? wall_us - leaf_us : 0));
+  sceIoWrite(fd, line, n);
+  if (cycles_valid) {
+    n = snprintf(line, sizeof(line), "%llu",
+                 (unsigned long long)(cycles > leaf_cycles ? cycles - leaf_cycles : 0));
+    sceIoWrite(fd, line, n);
+  }
+  sceIoWrite(fd, ",,,,,,,\n", 8);
+  for (int i = 0; i < 2; i++) {
+    const lp_frames *f = i ? between : loading;
+    n = snprintf(line, sizeof(line), "%s:%s,engine,%s,%llu,%u,%u,%llu,%llu,%llu,,,,,,,\n",
+                 scene, i ? "frames_between" : "frames_load", session,
+                 (unsigned long long)begin_us, f->frames, f->frames,
+                 (unsigned long long)f->wall_us, (unsigned long long)f->max_us,
+                 (unsigned long long)f->cycles);
+    sceIoWrite(fd, line, n);
+  }
+  /* Running totals and levels, as they stand when the load has finished. */
+  const struct mallinfo heap = mallinfo();
+  const struct {
+    const char *name;
+    unsigned calls;
+    uint64_t bytes;
+  } state[] = {
+      {"cache_hits", asset_cache.hits, asset_cache.hit_bytes},
+      {"cache_misses", asset_cache.misses, asset_cache.stored_bytes},
+      {"cache_used", asset_cache.evictions, asset_cache.used},
+      {"gunzip_fast", gunzip_fast, 0},
+      {"gunzip_fallback", gunzip_fallback, 0},
+      {"verify_bad", asset_verify_bad, 0},
+      {"heap_used", 1, (uint64_t)heap.uordblks},
+      {"heap_arena", 1, (uint64_t)heap.arena},
+      {"vgl_ram", 1, (uint64_t)vglMemFree(VGL_MEM_RAM)},
+      {"vgl_vram", 1, (uint64_t)vglMemFree(VGL_MEM_VRAM)},
+  };
+  for (unsigned i = 0; i < sizeof(state) / sizeof(state[0]); i++) {
+    n = snprintf(line, sizeof(line), "%s:%s,engine,%s,%llu,%u,0,,,,%llu,,,,,,\n", scene,
+                 state[i].name, session, (unsigned long long)begin_us, state[i].calls,
+                 (unsigned long long)state[i].bytes);
+    sceIoWrite(fd, line, n);
+  }
+  sceIoClose(fd);
+}
+
+/* What one measurement costs: it sits inside every region, so a reader needs it
+ * to judge the small ones. */
+static void perf_start_engine_thread(void) {
+  const SceUID self = SCE_PERF_ARM_PMON_THREAD_ID_SELF;
+  scePerfArmPmonStop(self);
+  for (unsigned i = 0; i < PERF_EVENTS; i++)
+    scePerfArmPmonSelectEvent(self, i, perf_events[i].code);
+  scePerfArmPmonReset(self);
+  scePerfArmPmonStart(self);
+  perf_thread = sceKernelGetThreadId();
+
+  lp_region probe;
+  memset(&probe, 0, sizeof(probe));
+  const uint32_t before = perf_cycles();
+  for (int i = 0; i < 256; i++) {
+    const lp_span span = lp_begin();
+    const uint64_t wall = sceKernelGetSystemTimeWide() - span.us;
+    probe.wall_us += wall;
+    probe.cycles += perf_cycles() - span.cycles;
+  }
+  trace("[perf] counting on t%08x; span costs %u cycles inside, %u outside, "
+        "total %u for 256\n",
+        (unsigned)perf_thread, (unsigned)(probe.cycles / 256),
+        (unsigned)((perf_cycles() - before - probe.cycles) / 256),
+        (unsigned)(perf_cycles() - before));
+}
+#endif
+
+static void load_profile_frame(uint64_t now_us, uint64_t previous_us) {
+  static lp_totals frame_start, burst_start, burst_end;
+  static uint64_t burst_begin_us, burst_last_us, burst_max_gap_us;
+  static unsigned burst_frames, idle_frames;
+  static int last_mode = -2, previous_mode = -2, burst_mode, burst_map;
+  static uint64_t mode_flip_us;
+
+#ifdef FF6_LIBPERF
+  static uint32_t frame_counters[PERF_EVENTS + 1], burst_counters[PERF_EVENTS + 1],
+      last_counters[PERF_EVENTS + 1], counters[PERF_EVENTS + 1];
+  static lp_frames frames_load, frames_between, frames_pending;
+  if (perf_loaded && !perf_thread) {
+    perf_start_engine_thread();
+    perf_read_events(frame_counters);
+  }
+  if (perf_thread)
+    perf_read_events(counters);
+#endif
+
+  const lp_totals now = lp;
+  const uint64_t gap_us = previous_us ? now_us - previous_us : 0;
+
+  int mode = ff6_current_mode();
+  if (mode != last_mode) {
+    trace("[mode] t=%llums frame=%u %d -> %d map=%d\n",
+          (unsigned long long)(now_us / 1000), gl_stats.frames, last_mode, mode,
+          ff6_current_map());
+    previous_mode = last_mode;
+    last_mode = mode;
+    mode_flip_us = now_us;
+  }
+
+  char fields[256];
+  if (gap_us >= 50000 && !lp_quiet) {
+    lp_format(fields, sizeof(fields), &now, &frame_start);
+    trace("[gap] t=%llums frame=%u mode=%d map=%d gap=%ums %s\n",
+          (unsigned long long)(now_us / 1000), gl_stats.frames, mode,
+          ff6_current_map(), (unsigned)(gap_us / 1000), fields);
+  }
+
+  /* A cache hit is a load too, even though it opens nothing. */
+  static unsigned frame_hits, burst_hits;
+  const unsigned hits = asset_cache.hits;
+  const int file_activity = now.r[LP_OPEN].calls != frame_start.r[LP_OPEN].calls ||
+                            now.r[LP_READ].calls != frame_start.r[LP_READ].calls ||
+                            hits != frame_hits;
+  if (file_activity) {
+    if (!burst_begin_us) {
+      burst_begin_us = previous_us ? previous_us : now_us;
+      burst_frames = 0;
+      burst_max_gap_us = 0;
+      burst_mode = mode;
+      burst_map = ff6_current_map();
+      /* frame_start, not now: this frame's work belongs to the burst too. */
+      burst_start = frame_start;
+      burst_hits = frame_hits;
+      for (int i = 0; i < LP_COUNT; i++)
+        lp.r[i].max_us = 0;
+#ifdef FF6_LIBPERF
+      memcpy(burst_counters, frame_counters, sizeof(burst_counters));
+      memset(&frames_load, 0, sizeof(frames_load));
+      memset(&frames_between, 0, sizeof(frames_between));
+      memset(&frames_pending, 0, sizeof(frames_pending));
+#endif
+    }
+    burst_last_us = now_us;
+    /* Closing frames draw and upload as usual, but they are not in wall_us. */
+    burst_end = now;
+#ifdef FF6_LIBPERF
+    memcpy(last_counters, counters, sizeof(last_counters));
+    frames_between.frames += frames_pending.frames;
+    frames_between.wall_us += frames_pending.wall_us;
+    frames_between.cycles += frames_pending.cycles;
+    if (frames_pending.max_us > frames_between.max_us)
+      frames_between.max_us = frames_pending.max_us;
+    memset(&frames_pending, 0, sizeof(frames_pending));
+#endif
+    idle_frames = 0;
+  }
+#ifdef FF6_LIBPERF
+  if (burst_begin_us && perf_thread) {
+    lp_frames *bucket = file_activity ? &frames_load : &frames_pending;
+    bucket->frames++;
+    bucket->wall_us += gap_us;
+    bucket->cycles += (uint32_t)(counters[PERF_EVENTS] - frame_counters[PERF_EVENTS]);
+    if (gap_us > bucket->max_us)
+      bucket->max_us = gap_us;
+  }
+#endif
+  if (burst_begin_us) {
+    burst_frames++;
+    if (gap_us > burst_max_gap_us)
+      burst_max_gap_us = gap_us;
+    /* Half a second with no file call closes the burst. */
+    if (!file_activity && ++idle_frames >= 30) {
+      const uint64_t wall_us = burst_last_us - burst_begin_us;
+      lp_format(fields, sizeof(fields), &burst_end, &burst_start);
+      trace("[burst] t=%llums mode=%d->%d map=%d->%d dur=%ums frames=%u "
+            "maxgap=%ums %s\n",
+            (unsigned long long)(burst_begin_us / 1000), burst_mode, mode,
+            burst_map, ff6_current_map(), (unsigned)(wall_us / 1000),
+            burst_frames - idle_frames, (unsigned)(burst_max_gap_us / 1000),
+            fields);
+#ifdef FF6_LIBPERF
+      if (perf_thread &&
+          now.r[LP_OPEN].calls - burst_start.r[LP_OPEN].calls + hits - burst_hits >= 15) {
+        char scene[32];
+        lp_scene_name(scene, sizeof(scene), burst_mode, mode, previous_mode,
+                      llabs((long long)burst_begin_us - (long long)mode_flip_us) < 3000000);
+        perf_csv_write(scene, burst_begin_us, wall_us, burst_counters, last_counters,
+                       &burst_end, &burst_start, &frames_load, &frames_between);
+      }
+#endif
+      burst_begin_us = 0;
+    }
+  }
+  frame_start = now;
+  frame_hits = hits;
+#ifdef FF6_LIBPERF
+  if (perf_thread)
+    memcpy(frame_counters, counters, sizeof(frame_counters));
+#endif
+}
+
+static unsigned eglswap_mark(void *dpy, void *surface) {
+  const lp_span span = lp_begin();
+  const unsigned result = fake_eglSwapBuffers(dpy, surface);
+  lp_end(LP_SWAP, span, 0);
+  return result;
+}
+
 static void gl_stats_report(void) {
   MARK("eglSwapBuffers");
   gl_stats.frames++;
@@ -3012,6 +4166,7 @@ static void gl_stats_report(void) {
       gap_logs++;
     }
   }
+  load_profile_frame(now_us, previous_swap_us);
   previous_swap_us = now_us;
 
   /* One-frame aligned capture: dropping ux0:data/ff6/dump.trigger dumps the
@@ -3056,7 +4211,6 @@ static void gl_stats_report(void) {
 
   /* Say WHERE this was measured. A number with no scene attached is how I
    * ended up quoting a battle when the question was about the town. */
-  extern int ff6_current_map(void);
 
   trace("[gl] frame %u map=%d draws/frame=%u binds/frame=%u skipped=%u "
         "(peak %u) tex=%u sub=%u glyphs=%u vp=%d,%d %dx%d "
@@ -3176,7 +4330,7 @@ static so_default_dynlib default_dynlib[] = {
     {"eglInitialize", (uintptr_t)&fake_eglInitialize},
     {"eglMakeCurrent", (uintptr_t)&fake_eglMakeCurrent},
     {"eglQuerySurface", (uintptr_t)&fake_eglQuerySurface},
-    {"eglSwapBuffers", (uintptr_t)&fake_eglSwapBuffers},
+    {"eglSwapBuffers", DBG_ALT((uintptr_t)&eglswap_mark, (uintptr_t)&fake_eglSwapBuffers)},
     {"eglTerminate", (uintptr_t)&fake_eglTerminate},
 
     /* GLES 1.x */
@@ -3250,27 +4404,27 @@ static so_default_dynlib default_dynlib[] = {
     {"deflateEnd", (uintptr_t)&deflateEnd},
     {"deflateInit2_", (uintptr_t)&deflateInit2_},
     {"deflateReset", (uintptr_t)&deflateReset},
-    {"inflate", (uintptr_t)&inflate},
+    {"inflate", DBG_ALT((uintptr_t)&inflate_mark, (uintptr_t)&inflate_fake)},
     {"inflateEnd", (uintptr_t)&inflateEnd},
     {"inflateReset2", (uintptr_t)&inflateReset2},
-    {"inflateInit2_", (uintptr_t)&inflateInit2_},
+    {"inflateInit2_", (uintptr_t)&inflateInit2_fake},
     {"inflateInit_", (uintptr_t)&inflateInit_},
     {"inflateReset", (uintptr_t)&inflateReset},
 
     /* runtime support */
     {"__aeabi_atexit", (uintptr_t)&__aeabi_atexit},
-    {"__aeabi_memclr", (uintptr_t)&aeabi_memclr},
-    {"__aeabi_memclr4", (uintptr_t)&aeabi_memclr},
-    {"__aeabi_memclr8", (uintptr_t)&aeabi_memclr},
-    {"__aeabi_memcpy", (uintptr_t)&aeabi_memcpy},
-    {"__aeabi_memcpy4", (uintptr_t)&aeabi_memcpy},
-    {"__aeabi_memcpy8", (uintptr_t)&aeabi_memcpy},
+    {"__aeabi_memclr", DBG_ALT((uintptr_t)&aeabi_memclr_mark, (uintptr_t)&aeabi_memclr)},
+    {"__aeabi_memclr4", DBG_ALT((uintptr_t)&aeabi_memclr_mark, (uintptr_t)&aeabi_memclr)},
+    {"__aeabi_memclr8", DBG_ALT((uintptr_t)&aeabi_memclr_mark, (uintptr_t)&aeabi_memclr)},
+    {"__aeabi_memcpy", DBG_ALT((uintptr_t)&memcpy_mark, (uintptr_t)&aeabi_memcpy)},
+    {"__aeabi_memcpy4", DBG_ALT((uintptr_t)&memcpy_mark, (uintptr_t)&aeabi_memcpy)},
+    {"__aeabi_memcpy8", DBG_ALT((uintptr_t)&memcpy_mark, (uintptr_t)&aeabi_memcpy)},
     {"__aeabi_memmove", (uintptr_t)&aeabi_memmove},
     {"__aeabi_memmove4", (uintptr_t)&aeabi_memmove},
     {"__aeabi_memmove8", (uintptr_t)&aeabi_memmove},
-    {"__aeabi_memset", (uintptr_t)&aeabi_memset},
-    {"__aeabi_memset4", (uintptr_t)&aeabi_memset},
-    {"__aeabi_memset8", (uintptr_t)&aeabi_memset},
+    {"__aeabi_memset", DBG_ALT((uintptr_t)&aeabi_memset_mark, (uintptr_t)&aeabi_memset)},
+    {"__aeabi_memset4", DBG_ALT((uintptr_t)&aeabi_memset_mark, (uintptr_t)&aeabi_memset)},
+    {"__aeabi_memset8", DBG_ALT((uintptr_t)&aeabi_memset_mark, (uintptr_t)&aeabi_memset)},
     {"__android_log_print", (uintptr_t)&__android_log_print},
     {"__assert2", (uintptr_t)&__assert2},
     {"__cxa_atexit", (uintptr_t)&__cxa_atexit},
@@ -3299,15 +4453,15 @@ static so_default_dynlib default_dynlib[] = {
      * of trying to call AMotionEvent_getAxisValue through a bogus pointer. */
     {"dlopen", (uintptr_t)&retNULL},
     {"dlsym", (uintptr_t)&retNULL},
-    {"fclose", (uintptr_t)&fclose},
-    {"feof", (uintptr_t)&feof},
+    {"fclose", (uintptr_t)&fclose_fake},
+    {"feof", (uintptr_t)&feof_fake},
     {"ferror", (uintptr_t)&ferror_hook},
     {"fflush", (uintptr_t)&fflush_hook},
     {"floor", WRAP((double (*)(double))floor)},
     {"fopen", DBG_ALT((uintptr_t)&fopen_mark, (uintptr_t)&fopen_fake)},
     {"fprintf", (uintptr_t)&fprintf_hook},
     {"fputc", (uintptr_t)&fputc_hook},
-    {"fread", DBG_ALT((uintptr_t)&fread_mark, (uintptr_t)&fread)},
+    {"fread", DBG_ALT((uintptr_t)&fread_mark, (uintptr_t)&fread_fake)},
     {"dladdr", (uintptr_t)&ret0},
     {"isxdigit", (uintptr_t)&isxdigit},
     {"islower", (uintptr_t)&islower},
@@ -3323,19 +4477,19 @@ static so_default_dynlib default_dynlib[] = {
     {"vfprintf", (uintptr_t)&vfprintf_hook},
     {"free", (uintptr_t)&free},
     {"frexp", WRAP((double (*)(double, int *))frexp)},
-    {"fseek", DBG_ALT((uintptr_t)&fseek_mark, (uintptr_t)&fseek)},
-    {"ftell", (uintptr_t)&ftell},
+    {"fseek", DBG_ALT((uintptr_t)&fseek_mark, (uintptr_t)&fseek_fake)},
+    {"ftell", (uintptr_t)&ftell_fake},
     {"fwrite", (uintptr_t)&fwrite},
     {"gettimeofday", (uintptr_t)&gettimeofday},
     {"gmtime", (uintptr_t)&gmtime},
     {"longjmp", (uintptr_t)&longjmp},
     {"lrand48", (uintptr_t)&lrand48},
-    {"malloc", (uintptr_t)&malloc},
+    {"malloc", DBG_ALT((uintptr_t)&malloc_mark, (uintptr_t)&malloc)},
     {"memchr", (uintptr_t)&memchr},
     {"memcmp", (uintptr_t)&memcmp},
-    {"memcpy", (uintptr_t)&memcpy},
+    {"memcpy", DBG_ALT((uintptr_t)&memcpy_mark, (uintptr_t)&memcpy)},
     {"memmove", (uintptr_t)&memmove},
-    {"memset", (uintptr_t)&memset},
+    {"memset", DBG_ALT((uintptr_t)&memset_mark, (uintptr_t)&memset)},
     {"mmap", (uintptr_t)&mmap_fake},
     {"modf", WRAP((double (*)(double, double *))modf)},
     {"munmap", (uintptr_t)&munmap_fake},
@@ -3447,6 +4601,8 @@ static uint16_t *ff6_AgbIo;
 int ff6_current_map(void) {
   return ff6_getFieldMapNo ? ff6_getFieldMapNo() : -1;
 }
+
+int ff6_current_mode(void) { return ff6_system_mode ? *ff6_system_mode : -1; }
 
 static void resolve_symbols(void) {
   g_app = (uint8_t *)so_symbol(&ff6_mod, "g_app");
@@ -3630,6 +4786,18 @@ static void drawGlyphHook(void *self, int idx, int *pixels) {
 #endif
 }
 
+#ifdef FF6_DEBUG
+static void drawGlyph_mark(void *self, int idx, int *pixels) {
+  if (!perf_counting()) {
+    drawGlyphHook(self, idx, pixels);
+    return;
+  }
+  const lp_scope scope = lp_scope_begin();
+  drawGlyphHook(self, idx, pixels);
+  lp_scope_end(-1, LP_TEXT, scope);
+}
+#endif
+
 static uintptr_t required_game_symbol(const char *name) {
   uintptr_t symbol = so_symbol(&ff6_mod, name);
   if (!symbol)
@@ -3649,7 +4817,25 @@ static void patch_game(void) {
             (uintptr_t)&ReadSaveDataResultHook);
 
   hook_addr(required_game_symbol("_ZN16TextGlyphTexture9drawGlyphEiPi"),
-            (uintptr_t)&drawGlyphHook);
+            DBG_ALT((uintptr_t)&drawGlyph_mark, (uintptr_t)&drawGlyphHook));
+
+#ifdef FF6_DEBUG
+  hook_rockopen(required_game_symbol("_ZN4Rock4File4OpenEPKc"));
+  static const uint16_t png_prologue[4] = {0xb570, 0xf100, 0x0608, 0x460d};
+  static const uint16_t tga_prologue[4] = {0xb5f8, 0xf100, 0x0708, 0x460e};
+  hook_decoder(required_game_symbol("_ZN6cUiMgr16LoadAndDecodePngEPKc"),
+               png_prologue, &ff6_png_resume, (uintptr_t)&png_mark, "ui_png");
+  hook_decoder(required_game_symbol("_ZN6cUiMgr16LoadAndDecodeTgaEPKc"),
+               tga_prologue, &ff6_tga_resume, (uintptr_t)&tga_mark, "ui_tga");
+  hook_pngopen(required_game_symbol("_ZN4cPng4OpenEPKc"));
+  static const uint16_t flbinit_prologue[4] = {0xb5f0, 0x4604, 0xb083, 0x460f};
+  static const uint16_t flbdata_prologue[4] = {0xe92d, 0x4ff8, 0x4605, 0x460c};
+  hook_decoder(required_game_symbol("_ZN4CFlb10InitCommonEP10CFlbDrawerPPKct"),
+               flbinit_prologue, &ff6_flbinit_resume, (uintptr_t)&flbinit_mark,
+               "flb_init");
+  hook_decoder(required_game_symbol("_ZN8CFlbData4InitEPKvm"), flbdata_prologue,
+               &ff6_flbdata_resume, (uintptr_t)&flbdata_mark, "flb_data");
+#endif
 
 
   /* No engine-camera aspect hook here. The presentation-only aspect_ratio
@@ -3938,7 +5124,56 @@ static int main_thread(SceSize args, void *argp) {
           trace("[auto] stopped at battle mode 6 for menu inspection\n");
         }
       }
-      if (autoplay) {
+      /* Load measurement: every 40 s tap the field's top-right menu icon and
+       * back out of it. In between, clear dialogue and battles with confirm
+       * and walk north into the next encounter. */
+      static int load_script = -1;
+      if (load_script < 0) {
+        SceIoStat st;
+        load_script = sceIoGetstat(DATA_PATH "/autoplay-load.trigger", &st) >= 0;
+        if (load_script)
+          trace("[auto] load measurement armed\n");
+      }
+      if (autoplay && load_script) {
+        const int phase = tick % (250 * 40);
+        const int field = ff6_system_mode && *ff6_system_mode == 1;
+        /* Which control opens the menu is what this cycle is finding out. */
+        const int attempt = (tick / (250 * 40)) % 3;
+        if (field && attempt && (phase == 0 || phase == 10)) {
+          send_key(19, 0);
+          send_key(attempt == 1 ? 100 : 99, phase == 0);
+          trace("[auto] menu key %d %s\n", attempt == 1 ? 100 : 99,
+                phase == 0 ? "down" : "up");
+        } else if (field && (phase == 0 || phase == 10)) {
+          fake_input_event event;
+          memset(&event, 0, sizeof(event));
+          event.type = AINPUT_EVENT_TYPE_MOTION;
+          event.source = AINPUT_SOURCE_TOUCHSCREEN;
+          event.action =
+              phase == 0 ? AMOTION_EVENT_ACTION_DOWN : AMOTION_EVENT_ACTION_UP;
+          event.pointer_count = 1;
+          event.x[0] = 850.0f;
+          event.y[0] = 40.0f;
+          map_scene_touch(&event.x[0], &event.y[0]);
+          send_key(19, 0);
+          ff6_inputMotion(&g_android_app, &event);
+          trace("[auto] menu icon %s at scene %.0f,%.0f\n",
+                phase == 0 ? "down" : "up", event.x[0], event.y[0]);
+        } else if (phase == 250 * 8 || phase == 250 * 9) {
+          send_key(97, 1); /* back out of the menu */
+        } else if (phase == 250 * 8 + 10 || phase == 250 * 9 + 10) {
+          send_key(97, 0);
+        } else if (phase >= 250 * 11) {
+          if (phase % 200 == 0)
+            send_key(96, 1);
+          else if (phase % 200 == 8)
+            send_key(96, 0);
+          else if (phase % 200 == 20)
+            send_key(19, 1);
+          else if (phase % 200 == 190)
+            send_key(19, 0);
+        }
+      } else if (autoplay) {
         /* Tap confirm to clear dialogue, and walk north the rest of the time:
          * from the Narshe entrance that runs into the guards that start the
          * first battle. */
@@ -4006,6 +5241,14 @@ static int check_kubridge(void) {
 static int file_exists(const char *path) {
   SceIoStat stat;
   return sceIoGetstat(path, &stat) >= 0;
+}
+
+static void validate_game_archive(void) {
+  SceIoStat stat;
+  if (sceIoGetstat(OBB_PATH, &stat) < 0 || stat.st_size != FF6_OBB_SIZE)
+    fatal_error("Unsupported or damaged main.obb.\nUse the OBB from "
+                "Final Fantasy VI Android " FF6_ANDROID_VERSIONS ".\n"
+                "See the README for the supported file sizes.");
 }
 
 /* The loader patches private layouts in known engine builds. Refuse a
@@ -4079,6 +5322,14 @@ int main(int argc, char *argv[]) {
   if (check_kubridge() < 0)
     fatal_error("Error kubridge.skprx is not installed.");
 
+#ifdef FF6_DEBUG
+  lp_quiet = file_exists(DATA_PATH "/profile.trigger");
+  asset_verify = file_exists(DATA_PATH "/cache-verify.trigger");
+#endif
+#ifdef FF6_LIBPERF
+  perf_load();
+#endif
+
   if (!file_exists("ur0:/data/libshacccg.suprx") &&
       !file_exists("ur0:/data/external/libshacccg.suprx"))
     fatal_error("Error libshacccg.suprx is not installed.");
@@ -4089,6 +5340,7 @@ int main(int argc, char *argv[]) {
   if (!file_exists(OBB_PATH))
     fatal_error("Error could not find %s.", OBB_PATH);
 
+  validate_game_archive();
   validate_game_library();
 
   InitJNIEnv();
@@ -4111,6 +5363,9 @@ int main(int argc, char *argv[]) {
     fatal_error("Unsupported libFF6.so: required imports could not be resolved.");
   trace("[ff6] patch_game...\n");
   patch_game();
+  /* Before vitaGL, which is brought up on the main thread and takes what is left. */
+  asset_cache_create();
+  install_asset_cache();
   so_flush_caches(&ff6_mod);
 
   trace("[ff6] so_initialize...\n");

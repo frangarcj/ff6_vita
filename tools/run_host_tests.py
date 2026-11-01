@@ -23,14 +23,15 @@ def main():
     flags = ['-std=c11', '-Wall', '-Wextra', '-Werror', '-g']
     if not args.no_sanitizers:
         flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer']
-    suites = ['text_encoding', 'file_compat', 'glyph_upload', 'glyph_cell_reuse',
+    suites = ['text_encoding', 'file_compat', 'obb_file', 'fast_gunzip', 'asset_cache', 'glyph_upload', 'glyph_cell_reuse',
               'sharp_bilinear', 'scene_clip', 'options', 'font_raster', 'font_alignment']
     for name in suites:
         sources = [str(ROOT/f'tests/test_{name}.c')]
         if name in ('font_raster', 'font_alignment'):
             sources.append(str(ROOT/'loader/stb_truetype.c'))
         binary = output/f'test_{name}'
-        subprocess.run([compiler, *flags, *sources, '-lm', '-o', str(binary)],
+        libraries = ['-lz', '-lm'] if name == 'fast_gunzip' else ['-lm']
+        subprocess.run([compiler, *flags, *sources, *libraries, '-o', str(binary)],
                        cwd=ROOT, check=True, timeout=90)
         subprocess.run([str(binary)], cwd=ROOT, check=True, timeout=90)
     for script in ('test_frame_present.py', 'test_package_assets.py'):

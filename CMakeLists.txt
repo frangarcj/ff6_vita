@@ -79,6 +79,15 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/build_profile.c"
   "const char ff6_build_profile[] __attribute__((used)) = \"FF6_BUILD_PROFILE=release\";\n"
   "#endif\n")
 
+# Debug only: count cycles per load with libperf. Point this at a libperf checkout
+# built in its build/ directory; the kernel plugin must already be loaded on the
+# console, and without it the game runs and measures wall time only.
+set(FF6_LIBPERF_DIR "" CACHE PATH "libperf checkout, built, for FF6_DEBUG profiling")
+if(FF6_DEBUG AND FF6_LIBPERF_DIR)
+  add_definitions(-DFF6_LIBPERF)
+  include_directories("${FF6_LIBPERF_DIR}/include")
+endif()
+
 set(VPK_FILE_ARGS
   ${CMAKE_SOURCE_DIR}/NotoSansJP-Regular.ttf NotoSansJP-Regular.ttf
   ${CMAKE_SOURCE_DIR}/NotoSansSC-Regular.ttf NotoSansSC-Regular.ttf
@@ -111,6 +120,10 @@ foreach(livearea_file
     ${CMAKE_SOURCE_DIR}/${livearea_file} ${livearea_file}
   )
 endforeach()
+
+if(FF6_DEBUG AND FF6_LIBPERF_DIR)
+  list(APPEND VPK_FILE_ARGS "${FF6_LIBPERF_DIR}/build/user/libperf.suprx" libperf.suprx)
+endif()
 
 add_executable(FF6.elf
   ${CMAKE_CURRENT_BINARY_DIR}/build_profile.c
@@ -166,6 +179,11 @@ target_link_libraries(FF6.elf
   pthread
   -Wl,--no-whole-archive
 )
+
+if(FF6_DEBUG AND FF6_LIBPERF_DIR)
+  # By path: VitaSDK ships a different archive under the same library name.
+  target_link_libraries(FF6.elf "${FF6_LIBPERF_DIR}/build/user/libScePerf_stub_weak.a")
+endif()
 
 vita_create_self(eboot.bin FF6.elf UNSAFE)
 

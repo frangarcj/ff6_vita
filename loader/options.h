@@ -41,6 +41,9 @@ static const ff6_option ff6_options[] = {
   FF6_OPTION("integerscale", integer_scale, 0, 1, 0),
   FF6_OPTION("fixedcolor", fixed_color_native, 0, 1, 0),
   FF6_OPTION("inplacetex", inplace_tex, 0, 1, 1),
+  FF6_OPTION("obbreader", obb_reader, 0, 1, 1),
+  FF6_OPTION("fastgzip", fast_gzip, 0, 1, 1),
+  FF6_OPTION("assetcache", asset_cache_mb, 0, 128, 64),
 };
 #undef FF6_OPTION
 #define FF6_OPTION_COUNT (sizeof(ff6_options) / sizeof(ff6_options[0]))

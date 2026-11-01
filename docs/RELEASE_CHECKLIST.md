@@ -1,7 +1,8 @@
 # Release candidate checklist
 
-Public candidate: **v1.0.0-rc1**. Earlier local RC1/RC2 snapshots and their
-evidence are preserved; those names were not public GitHub release numbers.
+Stable release: **v1.0.0**, published at the maintainer's decision; the gates below
+that were still open stay open as a record. Earlier local RC1/RC2 snapshots and
+their evidence are preserved; those names were not public GitHub release numbers.
 
 The public candidate adds the [FF3 parity features](FF3_PARITY.md), Configurator,
 LiveArea, PostFX and automated build/release workflows. Its authoritative
@@ -152,6 +153,9 @@ fontscale=100
 inplacetex=1
 offscreen=0
 fixedcolor=0
+obbreader=1
+fastgzip=1
+assetcache=64
 ```
 
 The loader requests 444 MHz CPU, 222 MHz bus/GPU and 166 MHz GPU crossbar

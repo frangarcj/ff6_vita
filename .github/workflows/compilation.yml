@@ -31,6 +31,8 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
+      - name: Host test dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
       - name: Host regressions (ASan and UBSan)
         run: python3 tools/run_host_tests.py
 
